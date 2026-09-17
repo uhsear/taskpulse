@@ -6,7 +6,9 @@ tells you that a Daily task has no next run time, that a task is overdue, or wha
 0x8007052E actually means. taskpulse joins those fields and prints a verdict.
 
 Read-only by design. It shells out to `Get-ScheduledTask | Get-ScheduledTaskInfo`,
-classifies the result in memory, and prints. What it refuses to do:
+classifies the result in memory, and prints. With --history it also reads the Task Scheduler
+Operational event log, which turns the one-slot snapshot into a week of runs and a duration
+baseline. What it refuses to do:
 
   * never creates, edits, enables, disables, deletes, starts or stops a task
   * never opens a network connection, and never asks for or stores a credential
@@ -24,6 +26,7 @@ from __future__ import annotations
 import argparse
 import csv
 import ctypes
+import io
 import json
 import ntpath
 import os
@@ -31,9 +34,9 @@ import re
 import shlex
 import subprocess
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 # Task Scheduler status codes (SCHED_S_*). These are "success" HRESULTs that mean
 # something other than "the job ran and worked".
@@ -75,6 +78,17 @@ EXT_KIND = {
     ".js": "JavaScript", ".ps1": "PowerShellScript", ".py": "PythonScript",
     ".pyw": "PythonScript", ".vbs": "VBScript", ".exe": "Executable",
 }
+
+# --history duration baseline. Advisory only: it never reaches health_status. A run at several
+# times a task's own mean, or suspiciously fast, is invisible to exit-code health but worth a
+# column. Gated at five completed runs so a new task's first couple of runs cannot set a
+# baseline off one sample.
+MIN_RUNS_FOR_DURATION_BASELINE = 5
+DURATION_ANOMALY_HIGH_RATIO = 2.0
+DURATION_ANOMALY_LOW_RATIO = 0.33
+
+# One fetch of the Operational log. See PS_HISTORY for why the count matters.
+HISTORY_MAX_EVENTS = 5000
 
 PS_QUERY = r"""
 $ErrorActionPreference = "Stop"
@@ -141,6 +155,77 @@ $rows = foreach ($task in Get-ScheduledTask) {
 $rows | ConvertTo-Json -Depth 4 -Compress
 """
 
+PS_HISTORY = r"""
+$ErrorActionPreference = "Stop"
+
+$LogName = "Microsoft-Windows-TaskScheduler/Operational"
+$DaysBack = __DAYS_BACK__
+$MaxEvents = __MAX_EVENTS__
+$MinRecordId = __MIN_RECORD_ID__
+
+function Convert-ToIsoUtcOrNull {
+    param($Value)
+    if ($null -eq $Value) { return $null }
+    try {
+        if ($Value -is [datetime] -and $Value -ge [datetime]'2000-01-01') {
+            return $Value.ToUniversalTime().ToString('o')
+        }
+    } catch { return $null }
+    return $null
+}
+
+function Get-XmlDataMap {
+    param([xml]$XmlEvent)
+    $map = @{}
+    if ($null -ne $XmlEvent -and $null -ne $XmlEvent.Event -and
+        $null -ne $XmlEvent.Event.EventData -and $null -ne $XmlEvent.Event.EventData.Data) {
+        foreach ($node in @($XmlEvent.Event.EventData.Data)) {
+            $name = [string]$node.Name
+            if ($name) { $map[$name] = [string]$node.'#text' }
+        }
+    }
+    return $map
+}
+
+# Measured on a busy server: the Operational log carries roughly 920 events a day, and only
+# about a quarter of them belong to the tasks you monitor - the rest is a browser updater and
+# Windows Error Reporting. A flat 5000-event window therefore reaches back about 5 days, not
+# the 30 you asked for. Once a watermark exists, fetch only records newer than it, so the
+# event budget is never spent re-reading history you already have. The time window below is
+# the cold-start branch, used only until the first watermark exists.
+if ($MinRecordId -gt 0) {
+    $xpath = "*[System[(EventRecordID > $MinRecordId) and (EventID=100 or EventID=102 or EventID=200 or EventID=201)]]"
+    $events = Get-WinEvent -LogName $LogName -FilterXPath $xpath -MaxEvents $MaxEvents -ErrorAction SilentlyContinue
+} else {
+    $start = (Get-Date).AddDays(-1 * $DaysBack)
+    $events = Get-WinEvent -FilterHashtable @{
+        LogName = $LogName
+        Id = @(100, 102, 200, 201)
+        StartTime = $start
+    } -MaxEvents $MaxEvents -ErrorAction SilentlyContinue
+}
+
+$rows = foreach ($event in $events) {
+    $xmlEvent = $null
+    try { [xml]$xmlEvent = $event.ToXml() } catch { $xmlEvent = $null }
+
+    $dataMap = Get-XmlDataMap $xmlEvent
+    $instanceId = [string]$dataMap['InstanceId']
+    if (-not $instanceId) { $instanceId = [string]$dataMap['TaskInstanceId'] }
+
+    [pscustomobject]@{
+        event_id = [int]$event.Id
+        event_record_id = [int64]$event.RecordId
+        event_time_utc = Convert-ToIsoUtcOrNull $event.TimeCreated
+        task_full_name = [string]$dataMap['TaskName']
+        instance_id = $instanceId
+        result_code = if ($dataMap.ContainsKey('ResultCode') -and $dataMap['ResultCode'] -ne '') { [int64]$dataMap['ResultCode'] } else { $null }
+    }
+}
+
+$rows | ConvertTo-Json -Depth 6 -Compress
+"""
+
 
 # --------------------------------------------------------------------------
 # pure helpers - no Windows API, no subprocess, no clock
@@ -159,6 +244,16 @@ def to_unsigned(code):
         return None
     try:
         return int(code) & 0xFFFFFFFF
+    except (TypeError, ValueError):
+        return None
+
+
+def to_int(value):
+    """Parse an event id or an event record id. None rather than an exception on junk."""
+    if value is None:
+        return None
+    try:
+        return int(value)
     except (TypeError, ValueError):
         return None
 
@@ -386,15 +481,57 @@ def attention_reason(task, status, now=None):
     return "; ".join(reasons) or result_text
 
 
-def evaluate(task, now=None):
-    """Enrich one raw task dict into a report row. Pure: dict in, dict out."""
-    target, kind = classify_command(task.get("executable"), task.get("arguments"))
-    status = health_status(task, now)
+def full_task_name(task):
+    r"""The rooted \Path\Name that Task Scheduler puts in the inventory and in the event log.
+
+    Both sides of the --history join build the name here rather than each spelling it out, so
+    a trailing-separator difference cannot silently drop a task's whole run history.
+    """
     path = text_of(task.get("task_path")) or "\\"
     if not path.endswith("\\"):
         path += "\\"
+    return path + text_of(task.get("task_name"))
+
+
+def duration_ratio(stats):
+    """Last run's duration as a multiple of this task's own mean, or None.
+
+    Advisory only - the caller must not feed this to health_status. Returns None below
+    MIN_RUNS_FOR_DURATION_BASELINE completed runs, because a baseline drawn from one or two
+    samples flags every normal task on its third run.
+    """
+    if stats.get("completed_run_count", 0) < MIN_RUNS_FOR_DURATION_BASELINE:
+        return None
+    mean = stats.get("mean_duration_seconds")
+    last = stats.get("last_duration_seconds")
+    if not mean or last is None:
+        return None
+    return last / mean
+
+
+def evaluate(task, now=None, stats=None):
+    """Enrich one raw task dict into a report row. Pure: dict in, dict out.
+
+    `stats` is this task's entry from summarize_runs() when --history ran, else None. The
+    history columns are emitted either way, so the CSV header does not change with the flag.
+    """
+    target, kind = classify_command(task.get("executable"), task.get("arguments"))
+    status = health_status(task, now)
+    stats = stats or {}
+    ratio = duration_ratio(stats)
+    anomaly = 1 if ratio is not None and (
+        ratio > DURATION_ANOMALY_HIGH_RATIO or ratio < DURATION_ANOMALY_LOW_RATIO) else 0
+    failures = int(stats.get("failures_last_7_days", 0) or 0)
+    runs = int(stats.get("runs_last_7_days", 0) or 0)
+    reasons = [attention_reason(task, status, now)]
+    if failures:
+        # The whole point of --history: a task whose last run was green can have failed every
+        # night for weeks, and the snapshot Task Scheduler keeps has one slot.
+        reasons.append("{} of {} run(s) in the last 7 days failed".format(failures, runs))
+    if anomaly:
+        reasons.append("last run took {:.1f}x its own baseline".format(ratio))
     return {
-        "task": path + text_of(task.get("task_name")),
+        "task": full_task_name(task),
         "status": status,
         "state": text_of(task.get("state")),
         "enabled": bool(task.get("enabled", True)),
@@ -408,8 +545,159 @@ def evaluate(task, now=None):
         "target_kind": kind,
         "run_as_user": text_of(task.get("run_as_user")),
         "author": text_of(task.get("author")),
-        "reason": attention_reason(task, status, now),
+        "reason": "; ".join([part for part in reasons if part]),
+        "runs_last_7_days": runs,
+        "failures_last_7_days": failures,
+        "last_duration_seconds": stats.get("last_duration_seconds"),
+        "duration_ratio": round(ratio, 3) if ratio is not None else None,
+        "is_duration_anomaly": anomaly,
     }
+
+
+# --------------------------------------------------------------------------
+# run history - the Operational log, grouped into runs (--history)
+# --------------------------------------------------------------------------
+
+def run_status(end_time, code):
+    """Verdict for one run in the event log, not for the task as a whole.
+
+    A run with no 102 event has not finished; a finished run with no 201 event recorded no
+    result, which is Unknown rather than Success.
+    """
+    if not text_of(end_time):
+        return "Running"
+    normalized = to_unsigned(code)
+    if normalized is None:
+        return "Unknown"
+    if normalized in NON_ERROR_CODES:
+        return "Success"
+    if normalized in WARNING_CODES:
+        return "Warning"
+    return "Error"
+
+
+def build_run_rows(events, tasks):
+    """Group Operational-log events into one row per run instance. Pure: events in, rows out.
+
+    Events 100 and 102 bracket a run and 201 carries the result code. A run whose 100 event
+    fell outside the fetch window used to emit a run with no start time at all - 57 such rows
+    in the table this was ported from - so the earliest observed event time is used instead
+    and the row carries start_time_estimated, which stops an estimate reading as a
+    measurement. A group with nothing datable at all is dropped, not emitted with no start.
+
+    An event naming a task that is not in `tasks` is skipped, so a filtered inventory yields a
+    filtered history rather than rows nothing can be joined to.
+    """
+    known = set(full_task_name(task) for task in tasks if text_of(task.get("task_name")))
+    grouped = {}
+
+    for raw in events:
+        instance_id = text_of(raw.get("instance_id"))
+        task_name = text_of(raw.get("task_full_name"))
+        if not instance_id or task_name not in known:
+            continue
+        group = grouped.setdefault(instance_id, {
+            "task": task_name,
+            "instance_id": instance_id,
+            "start_time": None,
+            "end_time": None,
+            "first_event_time": None,
+            "result_code": None,
+            "max_event_record_id": None,
+        })
+
+        event_id = to_int(raw.get("event_id"))
+        event_time = text_of(raw.get("event_time_utc"))
+        event_dt = parse_dt(event_time)
+        record_id = to_int(raw.get("event_record_id"))
+
+        if record_id is not None:
+            prior = group["max_event_record_id"]
+            group["max_event_record_id"] = record_id if prior is None else max(prior, record_id)
+        if event_dt is not None:
+            first = parse_dt(group["first_event_time"])
+            if first is None or event_dt < first:
+                group["first_event_time"] = event_time
+            if event_id == 100:
+                existing = parse_dt(group["start_time"])
+                if existing is None or event_dt < existing:
+                    group["start_time"] = event_time
+            elif event_id == 102:
+                existing = parse_dt(group["end_time"])
+                if existing is None or event_dt > existing:
+                    group["end_time"] = event_time
+        if event_id == 201:
+            code = to_unsigned(raw.get("result_code"))
+            if code is not None:
+                group["result_code"] = code
+
+    rows = []
+    for group in grouped.values():
+        start_estimated = 0
+        start_time = group["start_time"]
+        if not start_time:
+            start_time = group["first_event_time"]
+            start_estimated = 1 if start_time else 0
+        if not start_time:
+            continue  # nothing datable at all - an unusable row, not a row with no start
+        start_dt = parse_dt(start_time)
+        end_dt = parse_dt(group["end_time"])
+        duration = (round((end_dt - start_dt).total_seconds(), 2)
+                    if start_dt and end_dt and end_dt >= start_dt else None)
+        rows.append({
+            "task": group["task"],
+            "instance_id": group["instance_id"],
+            "start_time": start_time,
+            "start_time_estimated": start_estimated,
+            "end_time": text_of(group["end_time"]),
+            "duration_seconds": duration,
+            "result_code": group["result_code"],
+            "run_status": run_status(group["end_time"], group["result_code"]),
+            "max_event_record_id": group["max_event_record_id"],
+        })
+    rows.sort(key=lambda row: (row["task"].lower(), row["start_time"]))
+    return rows
+
+
+def summarize_runs(run_rows, now):
+    """Per-task 7-day counts, last duration and completed-run mean. Pure, one dict per task.
+
+    `now` is injected and never read from the clock. The version this was ported from took no
+    clock and called the wall clock inside the cutoff, so every test written against a pinned
+    clock passed on the day it was written and failed a week later.
+    """
+    cutoff = now - timedelta(days=7)
+    summary = {}
+
+    for run in run_rows:
+        key = text_of(run.get("task"))
+        if not key:
+            continue
+        entry = summary.setdefault(key, {
+            "runs_last_7_days": 0, "failures_last_7_days": 0,
+            "completed_run_count": 0, "last_duration_seconds": None,
+            "_last_start": None, "_duration_sum": 0.0,
+        })
+        started = parse_dt(run.get("start_time"))
+        duration = run.get("duration_seconds")
+        if started is not None:
+            if entry["_last_start"] is None or started > entry["_last_start"]:
+                entry["_last_start"] = started
+                entry["last_duration_seconds"] = duration
+            if started >= cutoff:
+                entry["runs_last_7_days"] += 1
+                if run.get("run_status") == "Error":
+                    entry["failures_last_7_days"] += 1
+        if duration is not None:
+            entry["completed_run_count"] += 1
+            entry["_duration_sum"] += duration
+
+    for entry in summary.values():
+        entry.pop("_last_start")
+        total = entry.pop("_duration_sum")
+        count = entry["completed_run_count"]
+        entry["mean_duration_seconds"] = (total / count) if count else None
+    return summary
 
 
 def is_microsoft_task(task):
@@ -437,19 +725,39 @@ def rows_from_json(raw):
     return [parsed] if isinstance(parsed, dict) else list(parsed)
 
 
-def read_tasks(timeout=120):
-    """Run the read-only PowerShell query and return raw task dicts."""
+def run_powershell(script, timeout, what):
+    """Run one read-only PowerShell script and return its rows. The only impure path."""
     if os.name != "nt":
         raise RuntimeError("taskpulse reads Windows Task Scheduler; this is not Windows.")
     command = ["powershell", "-NoProfile", "-NonInteractive",
-               "-ExecutionPolicy", "Bypass", "-Command", PS_QUERY]
+               "-ExecutionPolicy", "Bypass", "-Command", script]
     result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                             timeout=timeout)
     stdout = result.stdout.decode("utf-8", "replace")
     if result.returncode != 0:
-        raise RuntimeError("Task Scheduler query failed: "
+        raise RuntimeError("{} failed: ".format(what)
                            + result.stderr.decode("utf-8", "replace").strip())
     return rows_from_json(stdout)
+
+
+def read_tasks(timeout=120):
+    """Run the read-only PowerShell query and return raw task dicts."""
+    return run_powershell(PS_QUERY, timeout, "Task Scheduler query")
+
+
+def read_run_events(days_back=30, min_record_id=0, timeout=120):
+    """Return raw 100/102/200/201 events from the Task Scheduler Operational log.
+
+    Returns no events when that log is disabled, which is the Windows default: the query uses
+    -ErrorAction SilentlyContinue, so an absent or empty log is an empty history rather than a
+    failed audit. The substituted values are ints, never text, so nothing a caller types can
+    reach the script as PowerShell.
+    """
+    script = (PS_HISTORY
+              .replace("__DAYS_BACK__", str(int(days_back)))
+              .replace("__MAX_EVENTS__", str(int(HISTORY_MAX_EVENTS)))
+              .replace("__MIN_RECORD_ID__", str(int(min_record_id))))
+    return run_powershell(script, timeout, "Task Scheduler history query")
 
 
 # --------------------------------------------------------------------------
@@ -687,10 +995,145 @@ def self_test():
     ok(attention_reason(variant(enabled=False), "Disabled", now) == "task is disabled",
        "disabled reason is plain")
 
+    # --- run history: Operational-log events grouped into runs (--history) ---
+    inventory = [dict(base, task_path="\\Jobs\\", task_name="etl")]
+
+    def event(event_id, hour, instance="i1", task=r"\Jobs\etl", record_id=1, result_code=None):
+        return {"event_id": event_id, "instance_id": instance, "task_full_name": task,
+                "event_time_utc": "2026-07-28T{:02d}:00:00Z".format(hour),
+                "event_record_id": record_id, "result_code": result_code}
+
+    complete = build_run_rows([event(100, 1, record_id=10),
+                               event(201, 3, record_id=11, result_code=0),
+                               event(102, 3, record_id=12)], inventory)
+    ok(len(complete) == 1, "three events sharing one instance id collapse to one run row")
+    ok(complete[0]["duration_seconds"] == 7200.0, "events 100 and 102 bracket the duration")
+    ok(complete[0]["start_time_estimated"] == 0, "a real 100 event is not an estimated start")
+    ok(complete[0]["run_status"] == "Success", "event 201 carries the result code")
+    ok(complete[0]["max_event_record_id"] == 12,
+       "the watermark is the highest record id in the group, so it cannot go backwards")
+    truncated = build_run_rows([event(201, 4, record_id=20, result_code=0),
+                                event(102, 5, record_id=21)], inventory)
+    ok(truncated[0]["start_time_estimated"] == 1,
+       "a run whose 100 event fell outside the window is flagged, not given a null start"
+       "  <-- pinned defect")
+    ok(parse_dt(truncated[0]["start_time"]) == parse_dt("2026-07-28T04:00:00Z"),
+       "an estimated start is the earliest event time observed for that run")
+    undated = dict(event(100, 1, record_id=30))
+    undated["event_time_utc"] = None
+    ok(build_run_rows([undated], inventory) == [],
+       "a run with nothing datable is dropped, not emitted with no start time")
+    ok(build_run_rows([event(100, 1, task=r"\Jobs\other"),
+                       event(102, 2, task=r"\Jobs\other")], inventory) == [],
+       "an event naming a task absent from the inventory is skipped")
+    ok(build_run_rows([event(100, 1, instance="")], inventory) == [],
+       "an event with no instance id cannot be grouped and is skipped")
+    running = build_run_rows([event(100, 1, record_id=40)], inventory)
+    ok(running[0]["run_status"] == "Running" and running[0]["duration_seconds"] is None,
+       "a run with no 102 event is still running and has no duration")
+    ok(run_status("2026-07-28T03:00:00Z", None) == "Unknown",
+       "a finished run that recorded no result is Unknown, never Success")
+    ok(run_status("2026-07-28T03:00:00Z", -2147024894) == "Error",
+       "a failing HRESULT on a finished run is an Error")
+    ok(run_status("2026-07-28T03:00:00Z", TASK_TERMINATED) == "Warning",
+       "a terminated run is a Warning, exactly as the snapshot path grades it")
+    ok(len(build_run_rows([event(100, 1), event(100, 2, instance="i2")], inventory)) == 2,
+       "two instance ids are two runs")
+    repeated = build_run_rows([event(100, 2, record_id=50), event(100, 1, record_id=51),
+                               event(102, 4, record_id=52), event(102, 6, record_id=53)],
+                              inventory)
+    ok(repeated[0]["duration_seconds"] == 18000.0,
+       "a repeated 100 keeps the earliest start and a repeated 102 the latest end")
+    in_order = build_run_rows([event(100, 1, record_id=60), event(100, 2, record_id=61),
+                               event(102, 6, record_id=62), event(102, 4, record_id=63)],
+                              inventory)
+    ok(in_order[0]["duration_seconds"] == 18000.0,
+       "the same duplicates in the other order give the same run, so a re-read cannot shrink it")
+    no_code = build_run_rows([event(100, 1), event(201, 2), event(102, 3)], inventory)
+    ok(no_code[0]["result_code"] is None and no_code[0]["run_status"] == "Unknown",
+       "a 201 event carrying no result code leaves the run's result unknown")
+    no_record = build_run_rows([event(100, 1, record_id=None)], inventory)
+    ok(no_record[0]["max_event_record_id"] is None,
+       "an event with no record id leaves the watermark unset rather than zeroing it")
+    ok(to_int(None) is None and to_int("junk") is None,
+       "a junk event id or record id is dropped, not raised")
+    ok(to_int("102") == 102, "a numeric string event id is accepted")
+
+    # --- the 7-day window is measured from an injected clock, never the wall clock ---
+    def run(started, duration, status="Success"):
+        return {"task": r"\Jobs\etl", "start_time": started, "duration_seconds": duration,
+                "run_status": status}
+
+    windowed = summarize_runs([run("2026-07-26T01:00:00Z", 10.0),
+                               run("2026-06-28T01:00:00Z", 11.0)], now)[r"\Jobs\etl"]
+    ok(windowed["runs_last_7_days"] == 1,
+       "a 30-day-old run falls outside the window and a 2-day-old run does not, against the "
+       "clock the caller passed  <-- pinned defect")
+    ok(windowed["last_duration_seconds"] == 10.0,
+       "the newest run's duration wins, whatever order the rows arrive in")
+    ok(summarize_runs([], now) == {}, "no runs summarise to nothing")
+    ok(summarize_runs([run("", 10.0)], now)[r"\Jobs\etl"]["runs_last_7_days"] == 0,
+       "a run with an unparseable start counts towards no window")
+    ok(summarize_runs([{"task": "", "start_time": "2026-07-26T01:00:00Z"}], now) == {},
+       "a run with no task name is skipped, not filed under a blank key")
+    failing = summarize_runs([run("2026-07-26T01:00:00Z", 10.0, "Error"),
+                              run("2026-07-27T01:00:00Z", 10.0)], now)[r"\Jobs\etl"]
+    ok(failing["failures_last_7_days"] == 1 and failing["runs_last_7_days"] == 2,
+       "failures inside the window are counted apart from runs")
+    unfinished = summarize_runs([run("2026-07-26T01:00:00Z", None)], now)[r"\Jobs\etl"]
+    ok(unfinished["completed_run_count"] == 0 and unfinished["mean_duration_seconds"] is None,
+       "a run still in flight counts towards the week but not towards the baseline")
+    ok(duration_ratio({"completed_run_count": 9, "mean_duration_seconds": 0.0,
+                       "last_duration_seconds": 5.0}) is None,
+       "a zero mean yields no ratio rather than a division error")
+    ok("last 7 days" in evaluate(inventory[0], now, failing)["reason"],
+       "a task whose last run was green still reports the week's failures")
+
+    # --- duration baseline: advisory, and gated so a new task cannot trip it ---
+    four = [run("2026-07-2{}T01:00:00Z".format(day), 100.0) for day in (4, 5, 6, 7)]
+
+    def history_row(last_duration):
+        rows = four + [run("2026-07-28T01:00:00Z", last_duration)]
+        return evaluate(inventory[0], now, summarize_runs(rows, now)[r"\Jobs\etl"])
+
+    four_row = evaluate(inventory[0], now, summarize_runs(four, now)[r"\Jobs\etl"])
+    ok(four_row["duration_ratio"] is None and four_row["is_duration_anomaly"] == 0,
+       "four completed runs never set a baseline, however far apart their durations are")
+    ok(history_row(300.0)["is_duration_anomaly"] == 1,
+       "the fifth completed run sets the baseline, and 2.1x it flags")
+    ok(history_row(250.0)["is_duration_anomaly"] == 0,
+       "1.9x does not flag: the threshold is 2.0x, not 'slower than usual'")
+    ok(history_row(20.0)["is_duration_anomaly"] == 1,
+       "a run at a fraction of the baseline flags too: a job that stopped doing its work")
+    ok(history_row(300.0)["status"] == "Success",
+       "the duration baseline is advisory and never changes the health verdict")
+    ok("baseline" in history_row(300.0)["reason"], "the anomaly reaches the reason column")
+    ok(evaluate({})["runs_last_7_days"] == 0 and evaluate({})["duration_ratio"] is None,
+       "a run without --history still emits the history columns, so the CSV header is stable")
+    ok(full_task_name(dict(task_path="\\Jobs", task_name="etl")) == r"\Jobs\etl",
+       "a task path with no trailing separator still joins to the event log's name")
+    ok(evaluate(inventory[0])["task"] == full_task_name(inventory[0]),
+       "both sides of the history join build the task name the same way")
+
     # --- rendering never explodes ---
     ok("STATUS" in render_table([row]), "table renders a header")
     ok(r"\Jobs\etl" in render_table([row]), "table renders the task name")
     ok(json.loads(json.dumps([row])) == [row], "rows are JSON-serialisable")
+    csv_out = io.StringIO()
+    write_output([history_row(300.0)], "csv", csv_out)
+    ok("is_duration_anomaly" in csv_out.getvalue().splitlines()[0],
+       "the CSV header carries the history columns")
+    ok(len(csv_out.getvalue().splitlines()) == 2,
+       "a history row writes as one CSV row: the header is built from the same row shape")
+    json_out = io.StringIO()
+    write_output([row], "json", json_out)
+    ok(json.loads(json_out.getvalue()) == [row], "json output round-trips")
+    table_out = io.StringIO()
+    write_output([row], "table", table_out)
+    ok(r"\Jobs\etl" in table_out.getvalue(), "the table format writes the report")
+    empty_out = io.StringIO()
+    write_output([], "table", empty_out)
+    ok("No tasks need attention" in empty_out.getvalue(), "an empty report says so")
 
     print("self-test passed: {} assertions, offline, no credentials.".format(checks[0]))
     if not windows:
@@ -716,6 +1159,13 @@ def main(argv=None):
                         help="include healthy tasks, not just Warning/Error")
     parser.add_argument("--match", metavar="REGEX",
                         help="only tasks whose full path matches this regex")
+    parser.add_argument("--history", nargs="?", type=int, const=30, metavar="DAYS",
+                        help="also read the Task Scheduler Operational log and report each "
+                             "task's last 7 days of runs and its duration baseline "
+                             "(default: 30 days of events)")
+    parser.add_argument("--since-record-id", type=int, default=0, metavar="ID",
+                        help="with --history, read only event records newer than ID. Pass the "
+                             "watermark the previous run printed; the day window is ignored")
     parser.add_argument("--timeout", type=int, default=120, metavar="SECONDS",
                         help="Task Scheduler query timeout (default: 120)")
     parser.add_argument("--self-test", action="store_true",
@@ -736,13 +1186,31 @@ def main(argv=None):
         tasks = [task for task in tasks if not is_microsoft_task(task)]
 
     now = datetime.now(timezone.utc)
-    rows = [evaluate(task, now) for task in tasks]
+    run_summary = {}
+    if args.history is not None:
+        try:
+            events = read_run_events(args.history, args.since_record_id, args.timeout)
+        except Exception as error:
+            sys.stderr.write("taskpulse: {}\n".format(error))
+            return 1
+        run_summary = summarize_runs(build_run_rows(events, tasks), now)
+        # Report the watermark over every event fetched, not only the ones that joined to a
+        # task: an event for an unmonitored task is still an event this run has read.
+        watermark = max([to_int(raw.get("event_record_id")) or 0 for raw in events]
+                        + [args.since_record_id])
+        sys.stderr.write("taskpulse: read {} run event(s); next run can pass "
+                         "--since-record-id {}\n".format(len(events), watermark))
+
+    rows = [evaluate(task, now, run_summary.get(full_task_name(task))) for task in tasks]
 
     if args.match:
         pattern = re.compile(args.match, re.IGNORECASE)
         rows = [row for row in rows if pattern.search(row["task"])]
     if not args.show_ok:
-        rows = [row for row in rows if row["status"] in ("Warning", "Error")]
+        # A task that failed every night this week and succeeded tonight is exactly what
+        # --history exists to surface, so a week's failures keep a row that status alone drops.
+        rows = [row for row in rows
+                if row["status"] in ("Warning", "Error") or row["failures_last_7_days"]]
     rows.sort(key=lambda row: (row["status"] != "Error", row["task"].lower()))
 
     if args.out:
