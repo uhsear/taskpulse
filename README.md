@@ -129,3 +129,4 @@ MIT.
 Other single-file tools in this portfolio that pair with this one:
 
 - [jobharness](https://github.com/uhsear/jobharness) - give the failing task logging, retry and resume
+- [logsift](https://github.com/uhsear/logsift) - turn the logs those tasks write into a metric series
