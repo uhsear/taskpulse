@@ -23,6 +23,8 @@ taskpulse self-test: offline, no Task Scheduler, no network, no credentials
 PASS  the harness counts a failed check, a missing raise and a wrong exception
 PASS  signed form normalises to unsigned
 ...
+PASS  a secret set in a quoted cmd /c or -Command body never reaches the target  <-- pinned defect
+...
 PASS  a CSV cell a spreadsheet would run as a formula is written as text  <-- pinned defect
 ...
 PASS  a nightly python job switched to 'run only when logged on' is an Error, while its last result still reads success  <-- pinned defect
@@ -63,10 +65,10 @@ PASS  importing taskpulse runs nothing and prints nothing
 PASS  the import probe writes no .pyc beside the script  <-- pinned defect
 os message table: present
 --------------------------------------------------------------------
-416 assertions, 0 failed
+418 assertions, 0 failed
 ```
 
-The same command prints `416 assertions, 0 failed` on Windows with Python 3.13 and on Ubuntu
+The same command prints `418 assertions, 0 failed` on Windows with Python 3.13 and on Ubuntu
 with Python 3.12, and on Windows with Python 3.9. On Linux there is no OS message table, so
 the line above the footer rule reads
 `os message table: absent, so its assertions check the unmapped fallback`. Six assertions then
@@ -133,7 +135,7 @@ cd taskpulse
 python taskpulse.py --self-test
 ```
 
-That is the whole setup. `--self-test` runs 416 assertions with no network, no credentials and
+That is the whole setup. `--self-test` runs 418 assertions with no network, no credentials and
 no Task Scheduler access, so it passes on a locked-down box and in CI. Then run
 `python taskpulse.py` for the health report, or `python taskpulse.py --lint` for the lint.
 
@@ -435,6 +437,9 @@ Error, because only the machine knows whether `D:` is a disk or a mapping.
   task documents pasted end to end parse together. That puts any DOCTYPE inside an element,
   where the parser rejects it as malformed. No entity can expand, and no third-party parser is
   needed. Task XML never carries a DOCTYPE.
+* **PowerShell is started by its bare name.** Windows looks in the current folder before
+  System32, so a `powershell.exe` planted in the folder you run taskpulse from runs instead of
+  the real one. Run taskpulse from a folder that only you can write to.
 * **There is no network path**, so there is nothing to test against a stub server.
 
 ## Contributing

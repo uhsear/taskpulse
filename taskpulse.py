@@ -477,6 +477,21 @@ def extension_of(path_value):
     return os.path.splitext(unquote(path_value))[1].lower()
 
 
+def script_words(tokens):
+    r"""Each argument, with a quoted cmd /c or -Command body split into its own words.
+
+    The target is printed in every report format. A body such as
+    "set PGPASSWORD=x&& C:\jobs\refresh.bat" is one token, so only its script word may be
+    reported. Each word is also cut after its last & | or ;, so a secret set earlier in the
+    same word never becomes the target.
+    """
+    words = []
+    for token in tokens:
+        for word in (body_words(token) if re.search(r"\s", token) else [token]):
+            words.append(re.split(r"[&|;]", unquote(word))[-1].strip())
+    return words
+
+
 def classify_command(executable, arguments):
     """Find the real script behind an interpreter invocation.
 
@@ -506,7 +521,7 @@ def classify_command(executable, arguments):
         for index, token in enumerate(lowered):
             if token in ("-file", "-f") and index + 1 < len(tokens):
                 return unquote(tokens[index + 1]), "PowerShellScript"
-        for token in tokens:
+        for token in script_words(tokens):
             if token and not token.startswith("-") and extension_of(token) == ".ps1":
                 return token, "PowerShellScript"
         if "-command" in lowered or "-c" in lowered or "-encodedcommand" in lowered:
@@ -514,7 +529,7 @@ def classify_command(executable, arguments):
         return exe, "PowerShell"
 
     if name in CMD_EXES:
-        for token in tokens:
+        for token in script_words(tokens):
             if token and token[0] not in "/-" and extension_of(token) in (".bat", ".cmd"):
                 return token, "BatchScript"
         return exe, "CommandShell"
@@ -1511,6 +1526,16 @@ def self_test():
           "  <-- pinned defect")
     check(classify_command("cmd.exe", r"/c C:\jobs\nightly.bat")
           == (r"C:\jobs\nightly.bat", "BatchScript"), "cmd /c switch is skipped")
+    check(classify_command("cmd.exe", r'/c "set PGPASSWORD=Hunter2Zq&& C:\jobs\refresh.bat"')
+          == (r"C:\jobs\refresh.bat", "BatchScript")
+          and classify_command("powershell.exe", "-Command \"$env:API_TOKEN='Hunter2Zq';"
+                               r' & C:\jobs\sync.ps1"')
+          == (r"C:\jobs\sync.ps1", "PowerShellScript"),
+          "a secret set in a quoted cmd /c or -Command body never reaches the target"
+          "  <-- pinned defect")
+    check(classify_command("cmd.exe", r'/c "C:\my jobs\refresh.bat"')
+          == (r"C:\my jobs\refresh.bat", "BatchScript"),
+          "a quoted body that is one rooted path with a space stays whole")
     check(classify_command("cmd.exe", "/c exit 0") == ("cmd.exe", "CommandShell"),
           "cmd with no batch file is the command shell itself")
     check(classify_command("cscript.exe", r"//B C:\jobs\legacy.vbs")
