@@ -705,22 +705,32 @@ def evaluate(task, now=None, stats=None):
 # run history - the Operational log, grouped into runs (--history)
 # --------------------------------------------------------------------------
 
+def result_rank(code):
+    """0 for a success code, 1 for a Task Scheduler warning code, 2 for any other code."""
+    if code in NON_ERROR_CODES:
+        return 0
+    if code in WARNING_CODES:
+        return 1
+    return 2
+
+
 def run_status(end_time, code):
     """Verdict for one run in the event log, not for the task as a whole.
 
-    A run with no 102 event has not finished; a finished run with no 201 event recorded no
+    A failed action is an Error at once, even before the run's 102: a watermark read that lands
+    mid-run must count it, because the next read sees only the rest of the run. Otherwise a
+    run with no 102 event has not finished, and a finished run with no 201 event recorded no
     result, which is Unknown rather than Success.
     """
+    normalized = to_unsigned(code)
+    rank = None if normalized is None else result_rank(normalized)
+    if rank == 2:
+        return "Error"
     if not text_of(end_time):
         return "Running"
-    normalized = to_unsigned(code)
-    if normalized is None:
+    if rank is None:
         return "Unknown"
-    if normalized in NON_ERROR_CODES:
-        return "Success"
-    if normalized in WARNING_CODES:
-        return "Warning"
-    return "Error"
+    return "Success" if rank == 0 else "Warning"
 
 
 def build_run_rows(events, tasks):
@@ -751,17 +761,12 @@ def build_run_rows(events, tasks):
             "end_time": None,
             "first_event_time": None,
             "result_code": None,
-            "max_event_record_id": None,
         })
 
         event_id = to_int(raw.get("event_id"))
         event_time = text_of(raw.get("event_time_utc"))
         event_dt = parse_dt(event_time)
-        record_id = to_int(raw.get("event_record_id"))
 
-        if record_id is not None:
-            prior = group["max_event_record_id"]
-            group["max_event_record_id"] = record_id if prior is None else max(prior, record_id)
         if event_dt is not None:
             first = parse_dt(group["first_event_time"])
             if first is None or event_dt < first:
@@ -776,9 +781,10 @@ def build_run_rows(events, tasks):
                     group["end_time"] = event_time
         if event_id == 201:
             code = to_unsigned(raw.get("result_code"))
-            # One 201 per action, read in either order: a failed action is never overwritten
-            # by a later success, so the run's verdict does not depend on the read order.
-            if code is not None and group["result_code"] in (None,) + tuple(NON_ERROR_CODES):
+            # One 201 per action, read in either order: the worst code wins, so a failed
+            # action is never hidden by another action's success or warning code.
+            if code is not None and (group["result_code"] is None or
+                                     result_rank(code) > result_rank(group["result_code"])):
                 group["result_code"] = code
 
     rows = []
@@ -807,16 +813,16 @@ def build_run_rows(events, tasks):
             "duration_seconds": duration,
             "result_code": group["result_code"],
             "run_status": run_status(group["end_time"], group["result_code"]),
-            "max_event_record_id": group["max_event_record_id"],
         })
     rows.sort(key=lambda row: (row["task"].lower(), row["start_time"]))
     return rows
 
 
-def summarize_runs(run_rows, now, since_record_id=0):
+def summarize_runs(run_rows, now, since_record_id=None):
     """Per-task run counts, last duration and completed-run mean. Pure, one dict per task.
 
-    Without a watermark the counts cover the 7 days before `now`. With one, the read holds only
+    Without a watermark (None) the counts cover the 7 days before `now`. With one, even 0, the
+    read holds only
     the runs since that watermark, and taskpulse keeps nothing between runs, so the counts
     cover exactly those runs, whatever their age, and each entry's "window" says so. A failure
     is then counted by the one run that read it, and a backlog older than 7 days is not
@@ -826,7 +832,7 @@ def summarize_runs(run_rows, now, since_record_id=0):
     clock and called the wall clock inside the cutoff, so every test written against a pinned
     clock passed on the day it was written and failed a week later.
     """
-    cutoff = None if since_record_id > 0 else now - timedelta(days=7)
+    cutoff = None if since_record_id is not None else now - timedelta(days=7)
     window = ("since record %d" % since_record_id) if cutoff is None else "in the last 7 days"
     summary = {}
 
@@ -1351,19 +1357,20 @@ def history_query(days_back, min_record_id):
     and the next watermark passes every older record unread (measured), so a backlog larger
     than the cap would be skipped for good.
 
-    With no watermark there is no backlog yet, so the cold start reads newest first inside the
-    DAYS window. Oldest first, a capped cold read of a synthetic 30-day log of 17400 events held
+    A watermark of 0, which an empty read prints, is a watermark too: the whole log, oldest
+    first, so following the printed advice never skips a backlog. With no watermark (None)
+    there is no backlog yet, so the cold start reads newest first inside the DAYS window. Oldest first, a capped cold read of a synthetic 30-day log of 17400 events held
     not one run of the current week, so every 7-day column read 0.
     """
     ids = " or ".join("EventID=%d" % event_id for event_id in HISTORY_EVENT_IDS)
-    xpath = "*[System[(EventRecordID > %d) and (%s)" % (int(min_record_id), ids)
-    if int(min_record_id) > 0:
+    xpath = "*[System[(EventRecordID > %d) and (%s)" % (int(min_record_id or 0), ids)
+    if min_record_id is not None:
         return xpath + "]]", True
     window_ms = int(days_back) * 86400000
     return xpath + " and TimeCreated[timediff(@SystemTime) <= %d]]]" % window_ms, False
 
 
-def read_run_events(days_back=30, min_record_id=0, timeout=120):
+def read_run_events(days_back=30, min_record_id=None, timeout=120):
     """Return raw 100/102/200/201 events from the Task Scheduler Operational log.
 
     Oldest first past a watermark, newest first on a cold start (see history_query). It asks
@@ -1789,7 +1796,7 @@ def self_test():
               and "$MaxEvents = %d" % (HISTORY_MAX_EVENTS + 1) in scripts[1]
               and "__" not in scripts[1], "the history query receives integers for every slot, "
               "and one event more than the cap, so a capped read can be told apart")
-        read_run_events(3, 0)
+        read_run_events(3)
         check("$Oldest = $false" in scripts[2] and "<= 259200000]" in scripts[2],
               "a cold start reads newest first inside the DAYS window")
         raises(lambda: read_run_events("3; Remove-Item C:\\"),
@@ -1804,6 +1811,16 @@ def self_test():
                                   if not line.lstrip().startswith("#"))
         check("SilentlyContinue" not in history_code and "-ErrorAction Stop" in history_code,
               "a failed history read is never silenced into an empty history  <-- pinned defect")
+        # The Python half of the error rule is only as good as the script's catch: one that
+        # printed nothing, or an empty list, would turn access denied into a clean week.
+        caught = re.search(r"-ErrorAction Stop\)\n\} catch \{\n(.*?)\n\}\n", history_code,
+                           re.DOTALL)
+        check(caught is not None and [line.strip() for line in caught.group(1).splitlines()]
+              == ["[pscustomobject]@{ read_error = [string]$_.FullyQualifiedErrorId; "
+                  "message = [string]$_.Exception.Message } | ConvertTo-Json -Compress",
+                  "exit 0"],
+              "the history script's catch hands every failed read to python with its error id,"
+              " never an empty list  <-- pinned defect")
         check("-FilterHashtable" not in history_code and "-FilterXPath" in history_code,
               "the history read never uses -FilterHashtable, which reports access denied as no "
               "events  <-- pinned defect")
@@ -1845,12 +1862,13 @@ def self_test():
     check(history_query(30, 1) == ("*[System[(EventRecordID > 1) and %s]]" % ids, True),
           "past a watermark the read is oldest first, so a backlog is never skipped, and "
           "takes no time window  <-- pinned defect")
-    check(history_query(7, 0) == ("*[System[(EventRecordID > 0) and %s and TimeCreated["
-                                  "timediff(@SystemTime) <= 604800000]]]" % ids, False),
+    check(history_query(7, None) == ("*[System[(EventRecordID > 0) and %s and TimeCreated["
+                                     "timediff(@SystemTime) <= 604800000]]]" % ids, False),
           "a cold start reads the newest events of the DAYS window, so a capped read keeps "
           "the current week  <-- pinned defect")
-    check(history_query(7, -4)[1] is False and "<= 604800000" in history_query(7, -4)[0],
-          "a watermark below 1 is a cold start, not a read of the whole log")
+    check(history_query(7, 0) == ("*[System[(EventRecordID > 0) and %s]]" % ids, True),
+          "a watermark of 0, as an empty read prints, reads the whole log oldest first, so "
+          "passing it back never skips a backlog  <-- pinned defect")
 
     # --- a part of a task the live read could not get (PS_QUERY read_errors) ---
     unread = variant(read_errors="run details", last_task_result=None, next_run_time=None,
@@ -1907,8 +1925,19 @@ def self_test():
            for order in (actions, actions[::-1])] == ["Error", "Error"],
           "a failed action is not hidden by a later action's success, in either read order"
           "  <-- pinned defect")
-    check(complete[0]["max_event_record_id"] == 12,
-          "the watermark is the highest record id in the group, so it cannot go backwards")
+    warned = [event(201, 2, record_id=20, result_code=TASK_TERMINATED),
+              event(201, 3, record_id=21, result_code=1)]
+    check([build_run_rows(order + [event(102, 3, record_id=22)], inventory)[0]["run_status"]
+           for order in (warned, warned[::-1])] == ["Error", "Error"],
+          "a warning code from one action does not hide another action's failure, in either "
+          "read order  <-- pinned defect")
+    mid_run = build_run_rows([event(100, 1, record_id=30), event(200, 1, record_id=31),
+                              event(201, 2, record_id=32, result_code=1),
+                              event(200, 2, record_id=33)], inventory)
+    check(mid_run[0]["run_status"] == "Error"
+          and summarize_runs(mid_run, now, 29)[r"\Jobs\etl"]["failures_last_7_days"] == 1,
+          "a read that lands mid-run counts a failed action at once, because the next read "
+          "sees only the rest of the run  <-- pinned defect")
     truncated = build_run_rows([event(201, 4, record_id=20, result_code=0),
                                 event(102, 5, record_id=21)], inventory)
     check(truncated[0]["start_time_estimated"] == 1,
@@ -1964,9 +1993,6 @@ def self_test():
     no_code = build_run_rows([event(100, 1), event(201, 2), event(102, 3)], inventory)
     check(no_code[0]["result_code"] is None and no_code[0]["run_status"] == "Unknown",
           "a 201 event carrying no result code leaves the run's result unknown")
-    no_record = build_run_rows([event(100, 1, record_id=None)], inventory)
-    check(no_record[0]["max_event_record_id"] is None,
-          "an event with no record id leaves the watermark unset rather than zeroing it")
     check(to_int(None) is None and to_int("junk") is None,
           "a junk event id or record id is dropped, not raised")
     check(to_int("102") == 102, "a numeric string event id is accepted")
@@ -2002,6 +2028,14 @@ def self_test():
                               run("2026-07-27T01:00:00Z", 10.0)], now)[r"\Jobs\etl"]
     check(failing["failures_last_7_days"] == 1 and failing["runs_last_7_days"] == 2,
           "failures inside the window are counted apart from runs")
+    aged = summarize_runs([run("2026-07-21T11:00:00Z", 10.0, "Error"),  # 7 days 1 hour old
+                           run("2026-06-28T01:00:00Z", 10.0, "Error"),
+                           run("2026-07-26T01:00:00Z", 10.0, "Warning"),
+                           run("2026-07-26T02:00:00Z", None, "Unknown"),
+                           run("2026-07-27T01:00:00Z", 10.0)], now)[r"\Jobs\etl"]
+    check(aged["runs_last_7_days"] == 3 and aged["failures_last_7_days"] == 0,
+          "an Error older than 7 days counts as neither a run nor a failure of the week, and a "
+          "Warning or Unknown run is a run but not a failure  <-- pinned defect")
     unfinished = summarize_runs([run("2026-07-26T01:00:00Z", None)], now)[r"\Jobs\etl"]
     check(unfinished["completed_run_count"] == 0 and unfinished["mean_duration_seconds"] is None,
           "a run still in flight counts towards the week but not towards the baseline")
@@ -2017,6 +2051,9 @@ def self_test():
           in evaluate(inventory[0], now, sliced)["reason"],
           "past a watermark the columns count every run read, however old, and say they "
           "start at the watermark, not 'the last 7 days'  <-- pinned defect")
+    zero = summarize_runs([run("2026-06-28T01:00:00Z", 10.0)], now, 0)[r"\Jobs\etl"]
+    check(zero["runs_last_7_days"] == 1 and zero["window"] == "since record 0",
+          "a watermark of 0 is a watermark too: its columns count every run read")
 
     # --- duration baseline: advisory, and gated so a new task cannot trip it ---
     four = [run("2026-07-2%dT01:00:00Z" % day, 100.0) for day in (4, 5, 6, 7)]
@@ -2715,7 +2752,7 @@ def self_test():
         real_readers = read_tasks, read_run_events
         try:
             module["read_tasks"] = lambda timeout=120: [dict(t) for t in live]
-            module["read_run_events"] = lambda days, since=0, timeout=120: list(history)
+            module["read_run_events"] = lambda days, since=None, timeout=120: list(history)
             code, out, err = cli()
             check(code == 2 and r"\Jobs\broken" in out and r"\Jobs\etl" not in out
                   and "stock" not in out,
@@ -2759,15 +2796,24 @@ def self_test():
                       and "stopped at the 2-event cap" in err and "--since-record-id 71" in err,
                       "a watermark read that left events unread exits 1, never 0, and the next "
                       "run continues past the last event it kept  <-- pinned defect")
+                code, out, err = cli("--history", "--since-record-id", "0", "--match", "etl")
+                check(code == 1 and "newer events were not read" in err,
+                      "a capped read past a watermark of 0 is incomplete too, not a cold start")
                 code, out, err = cli("--history")
                 check(code == 2 and "7-day columns are complete" in err,
                       "a capped cold read that still reaches back 7 days is complete, and says "
                       "its baseline is short")
-                module["read_run_events"] = lambda days, since=0, timeout=120: list(week)
+                module["read_run_events"] = lambda days, since=None, timeout=120: list(week)
                 code, out, err = cli("--history", "--match", "etl")
                 check(code == 1 and "miss the older runs" in err and "incomplete" in err,
                       "a capped cold read that does not reach back 7 days exits 1, never a "
                       "clean report  <-- pinned defect")
+                module["read_run_events"] = lambda days, since=None, timeout=120: [
+                    ago(1, 102, "n", 30), ago(156, 100, "n", 20), ago(170, 100, "o", 10)]
+                code, out, err = cli("--history", "--match", "etl")
+                check(code == 1 and "miss the older runs" in err,
+                      "a capped cold read that reaches back 6.5 days, not 7, is incomplete too")
+                module["read_run_events"] = lambda days, since=None, timeout=120: list(week)
             finally:
                 module["HISTORY_MAX_EVENTS"] = real_cap
             code, out, err = cli("--history")
@@ -2775,11 +2821,11 @@ def self_test():
                   and "2 of 3 run(s) in the last 7 days failed" in out,
                   "the default report keeps a task whose last run was green but whose week "
                   "was not  <-- pinned defect")
-            module["read_run_events"] = lambda days, since=0, timeout=120: week[::-1]
+            module["read_run_events"] = lambda days, since=None, timeout=120: week[::-1]
             code, out, err = cli("--history", "--since-record-id", "500", "--match", "etl")
             check(code == 0 and "2 of 3 run(s) since record 500 failed" in out,
                   "a watermark run says its columns start at the watermark  <-- pinned defect")
-            module["read_run_events"] = lambda days, since=0, timeout=120: list(history)
+            module["read_run_events"] = lambda days, since=None, timeout=120: list(history)
             module["read_run_events"] = real_readers[1]
             module["run_powershell"] = lambda script, timeout, what: read_error(
                 "System.UnauthorizedAccessException,Microsoft.PowerShell.Commands."
@@ -2797,8 +2843,15 @@ def self_test():
             code, out, err = cli("--history", "--since-record-id", "50")
             check("read 0 run event(s); next run can pass --since-record-id 50" in err,
                   "a watermark read with nothing new hands the same watermark back, not 0")
+            sent = []
+            module["run_powershell"] = lambda script, timeout, what: sent.append(script) or []
+            code, out, err = cli("--history", "--since-record-id", "0")
+            check("$Oldest = $true" in sent[0] and "timediff" not in sent[0]
+                  and "--since-record-id 0" in err,
+                  "the --since-record-id 0 an empty read prints, passed back, reads the whole "
+                  "log oldest first, not a newest-first cold start  <-- pinned defect")
             module["run_powershell"] = real_bridge
-            module["read_run_events"] = lambda days, since=0, timeout=120: list(history)
+            module["read_run_events"] = lambda days, since=None, timeout=120: list(history)
             code, out, err = cli("--lint")
             check(code == 2 and "interactive-only" in out and "start-in-missing" in out
                   and "stock" not in out, "--lint alone lints the live inventory")
@@ -2902,10 +2955,14 @@ def self_test():
                                                ("--since-record-id", "5"),
                                                ("--history", "--since-record-id", "-1"))]
             check([code for code, out, err in refused] == [64] * 4
-                  and "1 or more" in refused[0][2] and "needs --history" in refused[2][2]
+                  and "7 or more" in refused[0][2] and "needs --history" in refused[2][2]
                   and "0 or more" in refused[3][2],
                   "--history 0 or less, which matches no event, and --since-record-id without "
                   "--history or below 0 are usage errors, not an empty history  <-- pinned defect")
+            code, out, err = cli("--history", "6")
+            check(code == 64 and "7 or more" in err and out == "",
+                  "--history below 7 days is a usage error: a shorter read would still label "
+                  "its columns 'the last 7 days'  <-- pinned defect")
             code, out, err = cli("--lint", loose, "--match", "(")
             check(code == 64 and "not a valid regex" in err and "Traceback" not in err,
                   "a bad --match regex is a usage error, not a traceback  <-- pinned defect")
@@ -3021,7 +3078,7 @@ def main(argv=None):
     mode.add_argument("--history", nargs="?", type=int, const=30, metavar="DAYS",
                       help="also read the Task Scheduler Operational log and report each "
                            "task's last 7 days of runs and its duration baseline "
-                           "(default: 30 days of events, newest first)")
+                           "(default: 30 days of events, newest first; at least 7)")
     mode.add_argument("--lint", nargs="*", metavar="PATH",
                       help="report configuration findings instead of run health. With no "
                            "PATH, lint the live Task Scheduler; with PATHs, lint exported task "
@@ -3031,8 +3088,8 @@ def main(argv=None):
                              "drives (default: C)")
     parser.add_argument("--since-record-id", type=int, metavar="ID",
                         help="with --history, read only event records newer than ID, oldest "
-                             "first. Pass the watermark the previous run printed. The day "
-                             "window is ignored, and the run columns count only the runs "
+                             "first. Pass the watermark the previous run printed, even 0. The "
+                             "day window is ignored, and the run columns count only the runs "
                              "since ID")
     parser.add_argument("--timeout", type=int, default=120, metavar="SECONDS",
                         help="Task Scheduler query timeout (default: 120)")
@@ -3046,14 +3103,15 @@ def main(argv=None):
         parser.error("--match is not a valid regex: %s" % error)
     if args.apply and not args.out:
         parser.error("--apply needs --out")
-    if args.history is not None and args.history < 1:
-        # 0 or less builds a window that matches nothing: an empty history, not an error.
-        parser.error("--history DAYS must be 1 or more")
+    if args.history is not None and args.history < 7:
+        # The run columns cover 7 days. A shorter window would read fewer days and still label
+        # them 'the last 7 days', so a failure 5 nights ago would vanish from a clean report.
+        parser.error("--history DAYS must be 7 or more, because the run columns cover 7 days")
     if args.since_record_id is not None and args.history is None:
         parser.error("--since-record-id needs --history")
     if (args.since_record_id or 0) < 0:
         parser.error("--since-record-id must be 0 or more")
-    since = args.since_record_id or 0
+    since = args.since_record_id  # None is a cold start; 0, as an empty read prints, is not
     if args.out and args.lint and any(inside(args.out, path) for path in args.lint):
         # One mistyped path would replace the export being linted with its own findings.
         parser.error("--out %s is an export this run lints, or inside one" % args.out)
@@ -3089,12 +3147,13 @@ def main(argv=None):
         # Report the watermark over every event fetched, not only the ones that joined to a
         # task: an event for an unmonitored task is still an event this run has read. Past a
         # watermark the read is oldest first, so every record below the new one has been read.
-        watermark = max([to_int(raw.get("event_record_id")) or 0 for raw in events] + [since])
+        watermark = max([to_int(raw.get("event_record_id")) or 0 for raw in events]
+                        + [since or 0])
         sys.stderr.write("taskpulse: read %d run event(s); next run can pass "
                          "--since-record-id %d\n" % (len(events), watermark))
         times = [parse_dt(raw.get("event_time_utc")) for raw in events]
         reach = min([when for when in times if when] or [now])
-        if capped and since:
+        if capped and since is not None:
             incomplete = True
             sys.stderr.write("taskpulse: the read stopped at the %d-event cap, so newer events "
                              "were not read and this report is incomplete; the next run "
