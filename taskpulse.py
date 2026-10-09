@@ -22,9 +22,10 @@ What it refuses to do:
   * never writes anywhere except stdout, or the one path you pass to --out, and that only
     with --apply; --self-test also uses a temporary folder, which it removes
 
-Exit codes: 0 = nothing in an Error state, 2 = at least one task (or, with --lint, one
-finding) in an Error state, 1 = taskpulse itself failed, 64 = usage error. Suitable as a
-monitoring check.
+Exit codes: 0 = nothing in an Error state and taskpulse saw everything it reports on, 2 = at
+least one task (or, with --lint, one finding) in an Error state, 1 = taskpulse itself failed
+or could not see everything (a task it could not fully read, or a --history read that failed
+or is incomplete), 64 = usage error. Suitable as a monitoring check.
 
 Python 3.9+, standard library only.
 """
@@ -678,11 +679,14 @@ def duration_ratio(stats):
     return last / mean
 
 
-def evaluate(task, now=None, stats=None):
+def evaluate(task, now=None, stats=None, history="off"):
     """Enrich one raw task dict into a report row. Pure: dict in, dict out.
 
     `stats` is this task's entry from summarize_runs() when --history ran, else None. The
     history columns are emitted either way, so the CSV header does not change with the flag.
+    `history` is how the run columns were read: "off" (no --history), "failed", "incomplete"
+    (the counts are a lower bound) or "complete". Unread run counts are None, never 0: a saved
+    report of a failed read must not match a clean read of an empty week.
     """
     target, kind = classify_command(task.get("executable"), task.get("arguments"))
     status = health_status(task, now)
@@ -690,8 +694,9 @@ def evaluate(task, now=None, stats=None):
     ratio = duration_ratio(stats)
     anomaly = 1 if ratio is not None and (
         ratio > DURATION_ANOMALY_HIGH_RATIO or ratio < DURATION_ANOMALY_LOW_RATIO) else 0
-    failures = int(stats.get("failures_last_7_days", 0) or 0)
-    runs = int(stats.get("runs_last_7_days", 0) or 0)
+    read = history in ("complete", "incomplete")
+    failures = int(stats.get("failures_last_7_days", 0) or 0) if read else None
+    runs = int(stats.get("runs_last_7_days", 0) or 0) if read else None
     reasons = [attention_reason(task, status, now)]
     if failures:
         # The whole point of --history: a task whose last run was green can have failed every
@@ -700,6 +705,8 @@ def evaluate(task, now=None, stats=None):
                        % (failures, runs, stats.get("window", "in the last 7 days")))
     if anomaly:
         reasons.append("last run took %.1fx its own baseline" % ratio)
+    if history in ("failed", "incomplete"):
+        reasons.append("run history %s" % ("unread" if history == "failed" else "incomplete"))
     return {
         "task": full_task_name(task),
         "status": status,
@@ -716,6 +723,7 @@ def evaluate(task, now=None, stats=None):
         "run_as_user": text_of(task.get("run_as_user")),
         "author": text_of(task.get("author")),
         "reason": "; ".join([part for part in reasons if part]),
+        "history": history,
         "runs_last_7_days": runs,
         "failures_last_7_days": failures,
         "last_duration_seconds": stats.get("last_duration_seconds"),
@@ -760,8 +768,8 @@ def build_run_rows(events, tasks):
     """Group Operational-log events into one row per run instance. Pure: events in, rows out.
 
     Events 100 and 102 bracket a run and 201 carries the result code. A run whose 100 event
-    fell outside the fetch window used to emit a run with no start time at all - 57 such rows
-    in the table this was ported from - so the earliest observed event time is used instead
+    fell outside the fetch window used to emit a run with no start time at all - dozens of such
+    rows in the table this was ported from - so the earliest observed event time is used instead
     and the row carries start_time_estimated, which stops an estimate reading as a
     measurement. Such a run gets no duration, so it never reaches the baseline. A group with
     nothing datable at all is dropped, not emitted with no start.
@@ -1406,7 +1414,7 @@ def log_range_gap(since, log, now):
 def history_query(days_back, min_record_id):
     """The XPath filter and the read order for one history read. Pure; both take ints only.
 
-    The Operational log is busy: on one server it carried roughly 900 events a day, so
+    The Operational log is busy: on one server it carried roughly a thousand events a day, so
     the HISTORY_MAX_EVENTS cap holds about five days. Which end of the match the cap keeps
     decides what is lost.
 
@@ -1869,6 +1877,9 @@ def self_test():
                                   if not line.lstrip().startswith("#"))
         check("SilentlyContinue" not in history_code and "-ErrorAction Stop" in history_code,
               "a failed history read is never silenced into an empty history  <-- pinned defect")
+        check(history_code.lstrip().startswith('$ErrorActionPreference = "Stop"'),
+              "the history script stops on any error, so a cast that fails in the event loop "
+              "stops the read and never drops that event")
         # The Python half of the error rule is only as good as the script's catch: one that
         # printed nothing, or an empty list, would turn access denied into a clean week.
         caught = re.search(r"-ErrorAction Stop\)\n\} catch \{\n(.*?)\n\}\n", history_code,
@@ -1962,6 +1973,8 @@ def self_test():
     check("records 101 to 9000" in gap and "overwritten" in gap,
           "records past the watermark that the log overwrote make the read incomplete"
           "  <-- pinned defect")
+    check("records 101 to 101" in (log_range_gap(100, span_of(102, 9652), now) or ""),
+          "one overwritten record past the watermark makes the read incomplete too")
     gap = log_range_gap(None, span_of(1, 30, days_old=4.0 / 24), now) or ""
     check("no record older than" in gap and "incomplete" in gap,
           "a cold start on a log younger than 7 days is incomplete  <-- pinned defect")
@@ -2154,13 +2167,13 @@ def self_test():
     check(duration_ratio({"completed_run_count": 9, "mean_duration_seconds": 0.0,
                           "last_duration_seconds": 5.0}) is None,
           "a zero mean yields no ratio rather than a division error")
-    check("last 7 days" in evaluate(inventory[0], now, failing)["reason"],
+    check("last 7 days" in evaluate(inventory[0], now, failing, "complete")["reason"],
           "a task whose last run was green still reports the week's failures")
     sliced = summarize_runs([run("2026-06-28T01:00:00Z", 10.0, "Error"),
                              run("2026-07-27T01:00:00Z", 10.0)], now, 9)[r"\Jobs\etl"]
     check(sliced["runs_last_7_days"] == 2 and sliced["failures_last_7_days"] == 1
           and "1 of 2 run(s) since record 9 failed"
-          in evaluate(inventory[0], now, sliced)["reason"],
+          in evaluate(inventory[0], now, sliced, "complete")["reason"],
           "past a watermark the columns count every run read, however old, and say they "
           "start at the watermark, not 'the last 7 days'  <-- pinned defect")
     zero = summarize_runs([run("2026-06-28T01:00:00Z", 10.0)], now, 0)[r"\Jobs\etl"]
@@ -2195,9 +2208,22 @@ def self_test():
     check(history_row(300.0)["status"] == "Success",
           "the duration baseline is advisory and never changes the health verdict")
     check("baseline" in history_row(300.0)["reason"], "the anomaly reaches the reason column")
-    check(evaluate({})["runs_last_7_days"] == 0 and evaluate({})["duration_ratio"] is None,
+    check(evaluate({})["runs_last_7_days"] is None and evaluate({})["history"] == "off"
+          and evaluate({})["duration_ratio"] is None,
           "a run without --history still emits the history columns, so the CSV header is "
-          "stable")
+          "stable, and leaves its run counts empty, not 0")
+    check(evaluate({}, None, None, "complete")["runs_last_7_days"] == 0
+          and evaluate({}, None, None, "complete")["failures_last_7_days"] == 0,
+          "a complete read of a task with no run in it counts 0 runs and 0 failures")
+    unread = evaluate(inventory[0], now, None, "failed")
+    check(unread["runs_last_7_days"] is None and unread["failures_last_7_days"] is None
+          and "run history unread" in unread["reason"],
+          "a failed history read leaves the run counts empty and says so, never a clean week "
+          "with 0 runs  <-- pinned defect")
+    partial = evaluate(inventory[0], now, failing, "incomplete")
+    check(partial["failures_last_7_days"] == failing["failures_last_7_days"]
+          and partial["history"] == "incomplete" and "run history incomplete" in partial["reason"],
+          "an incomplete read keeps its counts and marks them incomplete  <-- pinned defect")
     check(full_task_name(dict(task_path="\\Jobs", task_name="etl")) == r"\Jobs\etl",
           "a task path with no trailing separator still joins to the event log's name")
     check(evaluate(inventory[0])["task"] == full_task_name(inventory[0]),
@@ -2928,6 +2954,11 @@ def self_test():
                 check(code == 1 and "miss the older runs" in err and "incomplete" in err,
                       "a capped cold read that does not reach back 7 days exits 1, never a "
                       "clean report  <-- pinned defect")
+                code, out, err = cli("--history", "--show-ok", "--format", "json", "--match",
+                                     "etl")
+                check(json.loads(out)[0]["history"] == "incomplete"
+                      and "run history incomplete" in json.loads(out)[0]["reason"],
+                      "a capped cold read marks its json rows incomplete  <-- pinned defect")
                 module["read_run_events"] = serve([
                     ago(1, 102, "n", 30), ago(156, 100, "n", 20), ago(170, 100, "o", 10)])
                 code, out, err = cli("--history", "--match", "etl")
@@ -2957,18 +2988,39 @@ def self_test():
             code, out, err = cli("--history", "--match", "etl")
             check(code == 1 and "UnauthorizedAccessException" in err,
                   "an access-denied history read with no task in Error exits 1, never 0")
+            code, out, err = cli("--history", "--show-ok", "--match", "etl")
+            check("run history unread" in out,
+                  "an access-denied history read says 'run history unread' in the table too")
+            denied = cli("--history", "--show-ok", "--format", "json", "--match", "etl")[1]
             module["run_powershell"] = lambda script, timeout, what: read_error(
                 "LogDisabled", "the log is disabled, so it holds no run history")
             code, out, err = cli("--history", "--since-record-id", "50", "--match", "etl")
             check(code == 1 and "(LogDisabled)" in err and "read 0" not in err,
                   "a disabled operational log exits 1 and says so, never a clean week with 0 "
                   "runs  <-- pinned defect")
+            code, out, err = cli("--history", "--show-ok", "--format", "csv", "--match", "etl")
+            cells = list(csv.DictReader(io.StringIO(out)))[0]
+            check(cells["history"] == "failed" and cells["runs_last_7_days"] == ""
+                  and cells["failures_last_7_days"] == "",
+                  "a disabled log writes empty run cells to the CSV, never 0  <-- pinned defect")
             nothing = read_error("NoMatchingEventsFound,Microsoft.PowerShell.Commands."
                                  "GetWinEventCommand")
             module["run_powershell"] = lambda script, timeout, what: [span_of(1, 50)] + nothing
             code, out, err = cli("--history")
             check(code == 2 and r"\Jobs\broken" in out and "read 0 run event(s)" in err,
                   "a log with no matching events is zero events, and the report still runs")
+            quiet = cli("--history", "--show-ok", "--format", "json", "--match", "etl")[1]
+            gone, clean = json.loads(denied)[0], json.loads(quiet)[0]
+            check(denied != quiet and gone["history"] == "failed"
+                  and gone["runs_last_7_days"] is None and gone["failures_last_7_days"] is None
+                  and clean["history"] == "complete" and clean["runs_last_7_days"] == 0
+                  and clean["failures_last_7_days"] == 0,
+                  "the json of an access-denied read differs from a clean read of an empty "
+                  "log: null run counts, not 0  <-- pinned defect")
+            code, out, err = cli("--show-ok", "--format", "json", "--match", "etl")
+            check(json.loads(out)[0]["history"] == "off"
+                  and json.loads(out)[0]["runs_last_7_days"] is None,
+                  "without --history the json says history off and leaves the run counts null")
             code, out, err = cli("--history", "--since-record-id", "50", "--match", "etl")
             check(code == 0 and "read 0 run event(s); next run can pass --since-record-id 50"
                   in err, "a watermark read with nothing new hands the same watermark back, "
@@ -3296,6 +3348,7 @@ def main(argv=None):
     now = datetime.now(timezone.utc)
     run_summary = {}
     incomplete = False
+    history = "off"
     if args.history is not None:
         try:
             events, log = read_run_events(args.history, since, args.timeout)
@@ -3303,7 +3356,7 @@ def main(argv=None):
         except Exception as error:
             # The snapshot still prints and a task in Error still exits 2: on a stock box the
             # log is off, and a monitoring check must not lose its Error row to that.
-            incomplete = True
+            incomplete, history = True, "failed"
             sys.stderr.write("taskpulse: %s\ntaskpulse: the report has no run history, so it "
                              "is incomplete\n" % error)
         else:
@@ -3347,11 +3400,13 @@ def main(argv=None):
             if gap:
                 incomplete = True
                 sys.stderr.write("taskpulse: %s\n" % gap)
+            history = "incomplete" if incomplete else "complete"
 
     if lint:
         rows = lint_rows(tasks, args.local_drives.split(","), args.show_ok)
     else:
-        rows = [evaluate(task, now, run_summary.get(full_task_name(task))) for task in tasks]
+        rows = [evaluate(task, now, run_summary.get(full_task_name(task)), history)
+                for task in tasks]
 
     rows = [row for row in rows if pattern.search(row["task"])]
     if not lint and not args.show_ok:
