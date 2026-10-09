@@ -50,7 +50,7 @@ import xml.etree.ElementTree as ET
 from contextlib import redirect_stderr, redirect_stdout
 from datetime import datetime, timedelta, timezone
 
-__version__ = "1.2.0"
+__version__ = "1.3.0"
 
 # Task Scheduler status codes (SCHED_S_*). These are "success" HRESULTs that mean
 # something other than "the job ran and worked".
@@ -104,8 +104,9 @@ MIN_RUNS_FOR_DURATION_BASELINE = 5
 DURATION_ANOMALY_HIGH_RATIO = 2.0
 DURATION_ANOMALY_LOW_RATIO = 0.33
 
-# One fetch of the Operational log. See PS_HISTORY for why the count matters.
+# One fetch of the Operational log. See history_query for why the count matters.
 HISTORY_MAX_EVENTS = 5000
+HISTORY_EVENT_IDS = (100, 102, 200, 201)
 
 # --lint vocabulary. The XML schema and the PowerShell enum spell the same logon types
 # differently (InteractiveToken / Interactive), so both collapse to one word here.
@@ -199,10 +200,13 @@ function Get-TriggerTypeName {
 }
 
 $rows = foreach ($task in Get-ScheduledTask) {
+    # A part that could not be read is named here. Left blank, a task with no result and no
+    # trigger reads as one that has not run yet, and drops out of the report (see read_failures).
+    $failed = @()
     $info = $null
     try {
         $info = Get-ScheduledTaskInfo -TaskName $task.TaskName -TaskPath $task.TaskPath
-    } catch { }
+    } catch { $failed += "run details" }
 
     $exe = ""; $args = ""
     try {
@@ -211,7 +215,7 @@ $rows = foreach ($task in Get-ScheduledTask) {
             $exe = [string]$a[0].Execute
             $args = [string]$a[0].Arguments
         }
-    } catch { }
+    } catch { $failed += "actions" }
 
     # Every Exec action, for --lint. COM handler actions have no command line to judge.
     $actions = @()
@@ -225,7 +229,7 @@ $rows = foreach ($task in Get-ScheduledTask) {
                 }
             }
         }
-    } catch { }
+    } catch { $failed += "actions" }
 
     # A disabled trigger never fires, so it is left out, as the XML reader leaves it out.
     $triggerTypes = ""
@@ -233,7 +237,7 @@ $rows = foreach ($task in Get-ScheduledTask) {
         $triggerTypes = (@($task.Triggers) | Where-Object { $_.Enabled -ne $false } |
             ForEach-Object { Get-TriggerTypeName $_ } |
             Where-Object { $_ } | Select-Object -Unique) -join " | "
-    } catch { }
+    } catch { $failed += "triggers" }
 
     [pscustomobject]@{
         task_name             = [string]$task.TaskName
@@ -251,6 +255,7 @@ $rows = foreach ($task in Get-ScheduledTask) {
         next_run_time         = if ($info) { Convert-ToIsoUtcOrNull $info.NextRunTime } else { $null }
         last_task_result      = if ($info) { [int64]$info.LastTaskResult } else { $null }
         number_of_missed_runs = if ($info) { [int64]$info.NumberOfMissedRuns } else { $null }
+        read_errors           = $failed -join ","
     }
 }
 
@@ -261,9 +266,9 @@ PS_HISTORY = r"""
 $ErrorActionPreference = "Stop"
 
 $LogName = "Microsoft-Windows-TaskScheduler/Operational"
-$DaysBack = __DAYS_BACK__
+$XPath = '__XPATH__'
 $MaxEvents = __MAX_EVENTS__
-$MinRecordId = __MIN_RECORD_ID__
+$Oldest = __OLDEST__
 
 function Convert-ToIsoUtcOrNull {
     param($Value)
@@ -289,22 +294,20 @@ function Get-XmlDataMap {
     return $map
 }
 
-# Measured on a busy server: the Operational log carries roughly 920 events a day, and only
-# about a quarter of them belong to the tasks you monitor - the rest is a browser updater and
-# Windows Error Reporting. A flat 5000-event window therefore reaches back about 5 days, not
-# the 30 you asked for. Once a watermark exists, fetch only records newer than it, so the
-# event budget is never spent re-reading history you already have. The time window below is
-# the cold-start branch, used only until the first watermark exists.
-if ($MinRecordId -gt 0) {
-    $xpath = "*[System[(EventRecordID > $MinRecordId) and (EventID=100 or EventID=102 or EventID=200 or EventID=201)]]"
-    $events = Get-WinEvent -LogName $LogName -FilterXPath $xpath -MaxEvents $MaxEvents -ErrorAction SilentlyContinue
-} else {
-    $start = (Get-Date).AddDays(-1 * $DaysBack)
-    $events = Get-WinEvent -FilterHashtable @{
-        LogName = $LogName
-        Id = @(100, 102, 200, 201)
-        StartTime = $start
-    } -MaxEvents $MaxEvents -ErrorAction SilentlyContinue
+# history_query() builds $XPath and $Oldest; see it for why each part is there.
+#
+# -LogName with -FilterXPath, never -FilterHashtable: unelevated, the hashtable form reports
+# an access-denied log as NoMatchingEventsFound, which is a clean empty history (measured on
+# the Security log). The XPath form raises UnauthorizedAccessException.
+#
+# No -ErrorAction SilentlyContinue: it turned every failed read into an empty history. Every
+# failure is handed to Python with its error id, which treats only NoMatchingEventsFound as
+# empty (see history_events).
+try {
+    $events = @(Get-WinEvent -LogName $LogName -FilterXPath $XPath -MaxEvents $MaxEvents -Oldest:$Oldest -ErrorAction Stop)
+} catch {
+    [pscustomobject]@{ read_error = [string]$_.FullyQualifiedErrorId; message = [string]$_.Exception.Message } | ConvertTo-Json -Compress
+    exit 0
 }
 
 $rows = foreach ($event in $events) {
@@ -546,6 +549,18 @@ def classify_command(executable, arguments):
     return exe, "Executable" if exe else ""
 
 
+def read_failures(task):
+    """The parts of a live task the inventory read could not get, in order, without repeats.
+
+    PS_QUERY names each part whose read threw. An exported XML task has none.
+    """
+    parts = []
+    for part in text_of(task.get("read_errors")).split(","):
+        if part.strip() and part.strip() not in parts:
+            parts.append(part.strip())
+    return parts
+
+
 def health_status(task, now=None):
     """The verdict Windows never computes: join five fields into one word.
 
@@ -554,6 +569,8 @@ def health_status(task, now=None):
     """
     if not task.get("enabled", True):
         return "Disabled"
+    if read_failures(task):
+        return "Warning"  # a task the read could not see is not a task that has not run
 
     state = text_of(task.get("state")).lower()
     code = to_unsigned(task.get("last_task_result"))
@@ -588,6 +605,9 @@ def attention_reason(task, status, now=None):
     triggers = task.get("trigger_types")
     result_text = describe_result(task.get("last_task_result"))
 
+    failed = read_failures(task)
+    if failed:
+        reasons.append("the live read could not get its %s" % " or ".join(failed))
     if missed > 0:
         reasons.append("%d missed run(s)" % missed)
     if now and next_run and next_run < now:
@@ -653,7 +673,8 @@ def evaluate(task, now=None, stats=None):
     if failures:
         # The whole point of --history: a task whose last run was green can have failed every
         # night for weeks, and the snapshot Task Scheduler keeps has one slot.
-        reasons.append("%d of %d run(s) in the last 7 days failed" % (failures, runs))
+        reasons.append("%d of %d run(s) %s failed"
+                       % (failures, runs, stats.get("window", "in the last 7 days")))
     if anomaly:
         reasons.append("last run took %.1fx its own baseline" % ratio)
     return {
@@ -709,7 +730,8 @@ def build_run_rows(events, tasks):
     fell outside the fetch window used to emit a run with no start time at all - 57 such rows
     in the table this was ported from - so the earliest observed event time is used instead
     and the row carries start_time_estimated, which stops an estimate reading as a
-    measurement. A group with nothing datable at all is dropped, not emitted with no start.
+    measurement. Such a run gets no duration, so it never reaches the baseline. A group with
+    nothing datable at all is dropped, not emitted with no start.
 
     An event naming a task that is not in `tasks` is skipped, so a filtered inventory yields a
     filtered history rather than rows nothing can be joined to.
@@ -754,7 +776,9 @@ def build_run_rows(events, tasks):
                     group["end_time"] = event_time
         if event_id == 201:
             code = to_unsigned(raw.get("result_code"))
-            if code is not None:
+            # One 201 per action, read in either order: a failed action is never overwritten
+            # by a later success, so the run's verdict does not depend on the read order.
+            if code is not None and group["result_code"] in (None,) + tuple(NON_ERROR_CODES):
                 group["result_code"] = code
 
     rows = []
@@ -768,8 +792,12 @@ def build_run_rows(events, tasks):
             continue  # nothing datable at all - an unusable row, not a row with no start
         start_dt = parse_dt(start_time)
         end_dt = parse_dt(group["end_time"])
+        # An estimated start is the run's 201 or 102, seconds before its end, so it measures
+        # nothing: such a run counts towards the week but never gets a duration, which would
+        # read as a near-zero run and trip the baseline.
         duration = (round((end_dt - start_dt).total_seconds(), 2)
-                    if start_dt and end_dt and end_dt >= start_dt else None)
+                    if start_dt and end_dt and end_dt >= start_dt and not start_estimated
+                    else None)
         rows.append({
             "task": group["task"],
             "instance_id": group["instance_id"],
@@ -785,14 +813,21 @@ def build_run_rows(events, tasks):
     return rows
 
 
-def summarize_runs(run_rows, now):
-    """Per-task 7-day counts, last duration and completed-run mean. Pure, one dict per task.
+def summarize_runs(run_rows, now, since_record_id=0):
+    """Per-task run counts, last duration and completed-run mean. Pure, one dict per task.
+
+    Without a watermark the counts cover the 7 days before `now`. With one, the read holds only
+    the runs since that watermark, and taskpulse keeps nothing between runs, so the counts
+    cover exactly those runs, whatever their age, and each entry's "window" says so. A failure
+    is then counted by the one run that read it, and a backlog older than 7 days is not
+    dropped while the watermark moves past it.
 
     `now` is injected and never read from the clock. The version this was ported from took no
     clock and called the wall clock inside the cutoff, so every test written against a pinned
     clock passed on the day it was written and failed a week later.
     """
-    cutoff = now - timedelta(days=7)
+    cutoff = None if since_record_id > 0 else now - timedelta(days=7)
+    window = ("since record %d" % since_record_id) if cutoff is None else "in the last 7 days"
     summary = {}
 
     for run in run_rows:
@@ -802,7 +837,7 @@ def summarize_runs(run_rows, now):
         entry = summary.setdefault(key, {
             "runs_last_7_days": 0, "failures_last_7_days": 0,
             "completed_run_count": 0, "last_duration_seconds": None,
-            "_last_start": None, "_duration_sum": 0.0,
+            "_last_start": None, "_duration_sum": 0.0, "window": window,
         })
         started = parse_dt(run.get("start_time"))
         duration = run.get("duration_seconds")
@@ -810,7 +845,7 @@ def summarize_runs(run_rows, now):
             if entry["_last_start"] is None or started > entry["_last_start"]:
                 entry["_last_start"] = started
                 entry["last_duration_seconds"] = duration
-            if started >= cutoff:
+            if cutoff is None or started >= cutoff:
                 entry["runs_last_7_days"] += 1
                 if run.get("run_status") == "Error":
                     entry["failures_last_7_days"] += 1
@@ -975,6 +1010,11 @@ def lint_task(task, local_drives=("C",)):
     unattended = sorted(trigger_tokens(task.get("trigger_types")) & UNATTENDED_TRIGGERS)
     local = set(drive.strip().rstrip(":").upper() for drive in local_drives)
 
+    failed = read_failures(task)
+    if failed:
+        add("Warning", "read-failed",
+            "the live read could not get this task's %s, so the lint may have missed a "
+            "finding" % " or ".join(failed))
     if logon == "interactive" and unattended:
         # A settings change can flip a nightly job to "Run only when user is logged on".
         # Nothing then runs while nobody is logged on, and no run means no new result.
@@ -1265,7 +1305,11 @@ def run_powershell(script, timeout, what, runner=subprocess.run, platform=os.nam
                            "--lint FILE works on exported task XML anywhere.")
     command = ["powershell", "-NoProfile", "-NonInteractive",
                "-ExecutionPolicy", "Bypass", "-Command", script]
-    result = runner(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout)
+    try:
+        result = runner(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        # Its own message quotes the whole command line, which is the whole script.
+        raise RuntimeError("%s timed out after %d second(s)" % (what, timeout))
     stdout = result.stdout.decode("utf-8", "replace")
     if result.returncode != 0:
         raise RuntimeError("%s failed: %s"
@@ -1278,19 +1322,63 @@ def read_tasks(timeout=120):
     return run_powershell(PS_QUERY, timeout, "Task Scheduler query")
 
 
+def history_events(rows):
+    """The events of one history read, or a RuntimeError when the read failed. Pure.
+
+    The history script hands back either its event rows or one {read_error, message} row with
+    PowerShell's FullyQualifiedErrorId. Only NoMatchingEventsFound is an empty history: it is
+    what an empty or disabled log gives (measured). Access denied, a missing log or any other
+    failure stops the audit, because a history that could not be read is not a clean week.
+    """
+    failed = [row for row in rows if "read_error" in row]
+    if not failed:
+        return rows
+    error_id = text_of(failed[0].get("read_error"))
+    if error_id.split(",")[0] == "NoMatchingEventsFound":
+        return []
+    raise RuntimeError("the Task Scheduler Operational log could not be read (%s): %s"
+                       % (error_id or "no error id", text_of(failed[0].get("message"))))
+
+
+def history_query(days_back, min_record_id):
+    """The XPath filter and the read order for one history read. Pure; both take ints only.
+
+    The Operational log is busy: on one server it carried roughly 920 events a day, so
+    the HISTORY_MAX_EVENTS cap holds about five days. Which end of the match the cap keeps
+    decides what is lost.
+
+    Past a watermark the read is oldest first. Newest first, the cap keeps the newest events,
+    and the next watermark passes every older record unread (measured), so a backlog larger
+    than the cap would be skipped for good.
+
+    With no watermark there is no backlog yet, so the cold start reads newest first inside the
+    DAYS window. Oldest first, a capped cold read of a synthetic 30-day log of 17400 events held
+    not one run of the current week, so every 7-day column read 0.
+    """
+    ids = " or ".join("EventID=%d" % event_id for event_id in HISTORY_EVENT_IDS)
+    xpath = "*[System[(EventRecordID > %d) and (%s)" % (int(min_record_id), ids)
+    if int(min_record_id) > 0:
+        return xpath + "]]", True
+    window_ms = int(days_back) * 86400000
+    return xpath + " and TimeCreated[timediff(@SystemTime) <= %d]]]" % window_ms, False
+
+
 def read_run_events(days_back=30, min_record_id=0, timeout=120):
     """Return raw 100/102/200/201 events from the Task Scheduler Operational log.
 
-    Returns no events when that log is disabled, which is the Windows default: the query uses
-    -ErrorAction SilentlyContinue, so an absent or empty log is an empty history rather than a
-    failed audit. The substituted values are ints, never text, so nothing a caller types can
-    reach the script as PowerShell.
+    Oldest first past a watermark, newest first on a cold start (see history_query). It asks
+    for one event more than HISTORY_MAX_EVENTS, so the caller can tell a read that filled the
+    cap from one that ended there. An empty or disabled log, which is the Windows default, is
+    an empty history. Any other failed read raises (see history_events). The substituted
+    values are built from ints, never text, so nothing a caller types can reach the script as
+    PowerShell.
     """
+    xpath, oldest = history_query(days_back, min_record_id)
     script = (PS_HISTORY
-              .replace("__DAYS_BACK__", str(int(days_back)))
-              .replace("__MAX_EVENTS__", str(int(HISTORY_MAX_EVENTS)))
-              .replace("__MIN_RECORD_ID__", str(int(min_record_id))))
-    return run_powershell(script, timeout, "Task Scheduler history query")
+              .replace("__XPATH__", xpath)
+              .replace("__MAX_EVENTS__", str(int(HISTORY_MAX_EVENTS) + 1))
+              .replace("__OLDEST__", "$true" if oldest else "$false"))
+    return history_events(run_powershell(script, timeout, "Task Scheduler history query"))
 
 
 # --------------------------------------------------------------------------
@@ -1467,7 +1555,7 @@ def self_test():
           "0x8007052E is a bad service-account password")
     check(os_says(0x8007007A, "data area"), "0x8007007A is not 'access denied'")
     check(os_says(267011, "has not yet run"), "scheduler status codes decode too")
-    check(os_says(TASK_RUNNING, "currently running"), "TASK_RUNNING decodes")
+    check(os_says(TASK_RUNNING, "currently running"), "task_running decodes")
     check(describe_result(0x40010004).startswith("unmapped result 0x"),
           "codes with no message text report as unmapped")
     check(describe_result(0) == "success",
@@ -1666,6 +1754,17 @@ def self_test():
     raises(lambda: run_powershell("x", 9, "probe",
                                   lambda command, **kw: Finished(1, b"", b"denied"), "nt"),
            "a non-zero PowerShell exit raises with its stderr", RuntimeError)
+
+    def slow_run(command, **kwargs):
+        raise subprocess.TimeoutExpired(command, kwargs["timeout"])
+
+    said = ""
+    try:
+        run_powershell("$Secretish = 1", 9, "probe", slow_run, "nt")
+    except RuntimeError as error:
+        said = str(error)
+    check(said == "probe timed out after 9 second(s)",
+          "a timeout names the query and the limit, not the whole script")
     raises(lambda: run_powershell("x", 9, "probe", fake_run, "posix"),
            "off Windows the live query refuses before starting anything", RuntimeError)
     check(len(launched) == 1, "the off-Windows refusal never reached the runner")
@@ -1678,16 +1777,93 @@ def self_test():
         check(read_tasks(5) == [] and "logon_type" in scripts[0]
               and "working_directory" in scripts[0],
               "the live query asks for the logon type and every action's Start In")
+        check("catch { }" not in scripts[0] and 'catch { $failed += "run details" }' in
+              scripts[0] and 'read_errors           = $failed -join ","' in scripts[0],
+              "the live query names each part it could not read, never swallows the error"
+              "  <-- pinned defect")
         check("Where-Object { $_.Enabled -ne $false }" in scripts[0],
               "the live query leaves out a disabled trigger, as the XML reader does"
               "  <-- pinned defect")
         read_run_events(3, 99)
-        check("$DaysBack = 3" in scripts[1] and "$MinRecordId = 99" in scripts[1]
-              and "__" not in scripts[1], "the history query receives integers for every slot")
+        check("(EventRecordID > 99)" in scripts[1] and "$Oldest = $true" in scripts[1]
+              and "$MaxEvents = %d" % (HISTORY_MAX_EVENTS + 1) in scripts[1]
+              and "__" not in scripts[1], "the history query receives integers for every slot, "
+              "and one event more than the cap, so a capped read can be told apart")
+        read_run_events(3, 0)
+        check("$Oldest = $false" in scripts[2] and "<= 259200000]" in scripts[2],
+              "a cold start reads newest first inside the DAYS window")
         raises(lambda: read_run_events("3; Remove-Item C:\\"),
                "text that is not an integer never reaches the history script")
+        raises(lambda: read_run_events(3, "1) or (1=1"),
+               "a watermark that is not an integer never reaches the XPath")
+        check("-MaxEvents $MaxEvents -Oldest:$Oldest" in scripts[1]
+              and "-FilterXPath $XPath" in scripts[1],
+              "the read takes its order and filter from history_query")
+        # The script's comments name the flags it must not use; judge its code lines only.
+        history_code = "\n".join(line for line in scripts[1].splitlines()
+                                  if not line.lstrip().startswith("#"))
+        check("SilentlyContinue" not in history_code and "-ErrorAction Stop" in history_code,
+              "a failed history read is never silenced into an empty history  <-- pinned defect")
+        check("-FilterHashtable" not in history_code and "-FilterXPath" in history_code,
+              "the history read never uses -FilterHashtable, which reports access denied as no "
+              "events  <-- pinned defect")
+        module["run_powershell"] = lambda script, timeout, what: [
+            {"read_error": "System.UnauthorizedAccessException,Microsoft.PowerShell.Commands."
+                           "GetWinEventCommand", "message": "Attempted to perform an "
+                                                            "unauthorized operation."}]
+        raises(lambda: read_run_events(3), "the history reader applies the error rule to what "
+               "the bridge returns", RuntimeError)
     finally:
         module["run_powershell"] = real_bridge
+
+    # --- a history read that failed is a failure, never an empty week (--history) ---
+    def read_error(error_id, message="x"):
+        return [{"read_error": error_id, "message": message}]
+
+    check(history_events(read_error(
+        "NoMatchingEventsFound,Microsoft.PowerShell.Commands.GetWinEventCommand")) == [],
+        "only NoMatchingEventsFound, what an empty or disabled log gives, is an empty history")
+    raises(lambda: history_events(read_error(
+        "System.UnauthorizedAccessException,Microsoft.PowerShell.Commands.GetWinEventCommand")),
+        "an access-denied read raises, never an empty history  <-- pinned defect", RuntimeError)
+    raises(lambda: history_events(read_error(
+        "NoMatchingLogsFound,Microsoft.PowerShell.Commands.GetWinEventCommand")),
+        "a missing log raises too: NoMatchingLogsFound is not NoMatchingEventsFound",
+        RuntimeError)
+    said = ""
+    try:
+        history_events(read_error(None, "boom"))
+    except RuntimeError as error:
+        said = str(error)
+    check("no error id" in said and "boom" in said,
+          "a read error with no id still raises and keeps the message")
+    events_in = [{"event_id": 100, "event_record_id": 7}]
+    check(history_events(events_in) == events_in, "event rows pass through unchanged")
+
+    # --- which end of the log the event cap keeps (--history) ---
+    ids = "(EventID=100 or EventID=102 or EventID=200 or EventID=201)"
+    check(history_query(30, 1) == ("*[System[(EventRecordID > 1) and %s]]" % ids, True),
+          "past a watermark the read is oldest first, so a backlog is never skipped, and "
+          "takes no time window  <-- pinned defect")
+    check(history_query(7, 0) == ("*[System[(EventRecordID > 0) and %s and TimeCreated["
+                                  "timediff(@SystemTime) <= 604800000]]]" % ids, False),
+          "a cold start reads the newest events of the DAYS window, so a capped read keeps "
+          "the current week  <-- pinned defect")
+    check(history_query(7, -4)[1] is False and "<= 604800000" in history_query(7, -4)[0],
+          "a watermark below 1 is a cold start, not a read of the whole log")
+
+    # --- a part of a task the live read could not get (PS_QUERY read_errors) ---
+    unread = variant(read_errors="run details", last_task_result=None, next_run_time=None,
+                     number_of_missed_runs=None, trigger_types="Logon")
+    check(health_status(unread, now) == "Warning"
+          and "could not get its run details" in attention_reason(unread, "Warning", now),
+          "a task whose run details could not be read is a Warning, not a task that has not "
+          "run yet  <-- pinned defect")
+    check(read_failures({"read_errors": "actions, actions,triggers,"}) == ["actions", "triggers"]
+          and read_failures({}) == [] and read_failures({"read_errors": None}) == [],
+          "read failures are listed once each, in order, and an XML task has none")
+    check(health_status(variant(read_errors=""), now) == "Success",
+          "a live task read in full is judged as before")
 
     # --- reasons name the actual problem ---
     check("2 missed run(s)" in attention_reason(variant(number_of_missed_runs=2), "Warning",
@@ -1725,6 +1901,12 @@ def self_test():
     check(complete[0]["duration_seconds"] == 7200.0, "events 100 and 102 bracket the duration")
     check(complete[0]["start_time_estimated"] == 0, "a real 100 event is not an estimated start")
     check(complete[0]["run_status"] == "Success", "event 201 carries the result code")
+    actions = [event(201, 2, record_id=20, result_code=1), event(201, 3, record_id=21,
+                                                                 result_code=0)]
+    check([build_run_rows(order + [event(102, 3, record_id=22)], inventory)[0]["run_status"]
+           for order in (actions, actions[::-1])] == ["Error", "Error"],
+          "a failed action is not hidden by a later action's success, in either read order"
+          "  <-- pinned defect")
     check(complete[0]["max_event_record_id"] == 12,
           "the watermark is the highest record id in the group, so it cannot go backwards")
     truncated = build_run_rows([event(201, 4, record_id=20, result_code=0),
@@ -1734,6 +1916,20 @@ def self_test():
           "  <-- pinned defect")
     check(parse_dt(truncated[0]["start_time"]) == parse_dt("2026-07-28T04:00:00Z"),
           "an estimated start is the earliest event time observed for that run")
+    check(truncated[0]["duration_seconds"] is None,
+          "a run with an estimated start gets no duration  <-- pinned defect")
+    measured = []
+    for hour in (1, 3, 5, 7, 9):  # five one-hour runs arm the baseline
+        measured += [event(100, hour, instance="m%d" % hour, record_id=hour * 10),
+                     event(102, hour + 1, instance="m%d" % hour, record_id=hour * 10 + 1)]
+    split = build_run_rows(measured + [event(201, 11, instance="cut", record_id=200,
+                                             result_code=0),
+                                       event(102, 11, instance="cut", record_id=201)],
+                           inventory)
+    split_row = evaluate(inventory[0], now, summarize_runs(split, now)[r"\Jobs\etl"])
+    check(len(split) == 6 and split_row["is_duration_anomaly"] == 0,
+          "a run cut off from its 100 event by the read cap counts, but never reads as a "
+          "zero-second run against the baseline  <-- pinned defect")
     undated = dict(event(100, 1, record_id=30))
     undated["event_time_utc"] = None
     check(build_run_rows([undated], inventory) == [],
@@ -1777,6 +1973,8 @@ def self_test():
     backwards = build_run_rows([event(100, 5), event(102, 4)], inventory)
     check(backwards[0]["duration_seconds"] is None,
           "an end before the start yields no duration rather than a negative one")
+    check(build_run_rows([event(100, 4), event(102, 4)], inventory)[0]["duration_seconds"]
+          == 0.0, "an end at the start is a zero-second run, not a missing duration")
     check(build_run_rows([event(100, 1, record_id=None), event(102, 2, record_id=None),
                           event(999, 3, record_id=None)], inventory)[0]["duration_seconds"]
           == 3600.0, "an unknown event id dates the run but brackets nothing")
@@ -1812,6 +2010,13 @@ def self_test():
           "a zero mean yields no ratio rather than a division error")
     check("last 7 days" in evaluate(inventory[0], now, failing)["reason"],
           "a task whose last run was green still reports the week's failures")
+    sliced = summarize_runs([run("2026-06-28T01:00:00Z", 10.0, "Error"),
+                             run("2026-07-27T01:00:00Z", 10.0)], now, 9)[r"\Jobs\etl"]
+    check(sliced["runs_last_7_days"] == 2 and sliced["failures_last_7_days"] == 1
+          and "1 of 2 run(s) since record 9 failed"
+          in evaluate(inventory[0], now, sliced)["reason"],
+          "past a watermark the columns count every run read, however old, and say they "
+          "start at the watermark, not 'the last 7 days'  <-- pinned defect")
 
     # --- duration baseline: advisory, and gated so a new task cannot trip it ---
     four = [run("2026-07-2%dT01:00:00Z" % day, 100.0) for day in (4, 5, 6, 7)]
@@ -1820,6 +2025,10 @@ def self_test():
         rows = four + [run("2026-07-28T01:00:00Z", last_duration)]
         return evaluate(inventory[0], now, summarize_runs(rows, now)[r"\Jobs\etl"])
 
+    edge = evaluate(inventory[0], now, {"completed_run_count": 5, "mean_duration_seconds": 100.0,
+                                        "last_duration_seconds": 33.0})
+    check(edge["duration_ratio"] == 0.33 and edge["is_duration_anomaly"] == 0,
+          "a run at exactly the low ratio is not an anomaly; only a shorter one is")
     four_row = evaluate(inventory[0], now, summarize_runs(four, now)[r"\Jobs\etl"])
     check(four_row["duration_ratio"] is None and four_row["is_duration_anomaly"] == 0,
           "four completed runs never set a baseline, however far apart their durations are")
@@ -1915,6 +2124,9 @@ def self_test():
           "an interactive task with only a logon trigger runs exactly when it is meant to")
     check(finding_checks(job(logon="InteractiveTokenOrPassword")) == [],
           "interactive-or-password can run with nobody logged on")
+    check(finding_checks(dict(job(), read_errors="actions", actions=[]))
+          == [("Warning", "read-failed")],
+          "a task whose actions could not be read is not a clean lint  <-- pinned defect")
     check("svc-etl is logged on" in lint_task(job(logon="InteractiveToken"))[0]["detail"]
           and "Daily trigger" in lint_task(job(logon="InteractiveToken"))[0]["detail"],
           "the finding names the account and the trigger that will be skipped")
@@ -2519,6 +2731,74 @@ def self_test():
             code, out, err = cli("--history", "--since-record-id", "50")
             check("read 3 run event(s)" in err and "--since-record-id 90" in err,
                   "--history reports the watermark over every event read, joined or not")
+            check("cap" not in err, "a read below the event cap says nothing about a cap")
+            clock = datetime.now(timezone.utc)  # main reads the clock, so this week is real
+
+            def ago(hours, event_id, run_id, record_id, result_code=None):
+                return {"event_id": event_id, "instance_id": run_id,
+                        "task_full_name": r"\Jobs\etl", "event_record_id": record_id,
+                        "event_time_utc": (clock - timedelta(hours=hours)).isoformat(),
+                        "result_code": result_code}
+
+            week = []  # newest first, as a cold start reads: green tonight, two failed nights
+            for night, code in enumerate((0, 1, 1)):
+                hours, top = 2 + 24 * night, 1000 - 3 * night
+                week += [ago(hours - 1, 102, "w%d" % night, top),
+                         ago(hours - 1, 201, "w%d" % night, top - 1, code),
+                         ago(hours, 100, "w%d" % night, top - 2)]
+            real_cap = HISTORY_MAX_EVENTS  # read now, before the global is patched
+            module["HISTORY_MAX_EVENTS"] = 3
+            try:
+                code, out, err = cli("--history", "--since-record-id", "50")
+                check("read 3 run event(s)" in err and "cap" not in err,
+                      "a read of exactly the cap left nothing unread, so it is not called "
+                      "incomplete  <-- pinned defect")
+                module["HISTORY_MAX_EVENTS"] = 2
+                code, out, err = cli("--history", "--since-record-id", "50", "--match", "etl")
+                check(code == 1 and "read 2 run event(s)" in err and "incomplete" in err
+                      and "stopped at the 2-event cap" in err and "--since-record-id 71" in err,
+                      "a watermark read that left events unread exits 1, never 0, and the next "
+                      "run continues past the last event it kept  <-- pinned defect")
+                code, out, err = cli("--history")
+                check(code == 2 and "7-day columns are complete" in err,
+                      "a capped cold read that still reaches back 7 days is complete, and says "
+                      "its baseline is short")
+                module["read_run_events"] = lambda days, since=0, timeout=120: list(week)
+                code, out, err = cli("--history", "--match", "etl")
+                check(code == 1 and "miss the older runs" in err and "incomplete" in err,
+                      "a capped cold read that does not reach back 7 days exits 1, never a "
+                      "clean report  <-- pinned defect")
+            finally:
+                module["HISTORY_MAX_EVENTS"] = real_cap
+            code, out, err = cli("--history")
+            check(code == 2 and r"\Jobs\etl" in out
+                  and "2 of 3 run(s) in the last 7 days failed" in out,
+                  "the default report keeps a task whose last run was green but whose week "
+                  "was not  <-- pinned defect")
+            module["read_run_events"] = lambda days, since=0, timeout=120: week[::-1]
+            code, out, err = cli("--history", "--since-record-id", "500", "--match", "etl")
+            check(code == 0 and "2 of 3 run(s) since record 500 failed" in out,
+                  "a watermark run says its columns start at the watermark  <-- pinned defect")
+            module["read_run_events"] = lambda days, since=0, timeout=120: list(history)
+            module["read_run_events"] = real_readers[1]
+            module["run_powershell"] = lambda script, timeout, what: read_error(
+                "System.UnauthorizedAccessException,Microsoft.PowerShell.Commands."
+                "GetWinEventCommand", "Attempted to perform an unauthorized operation.")
+            code, out, err = cli("--history")
+            check(code == 1 and out == "" and "UnauthorizedAccessException" in err
+                  and "read 0" not in err,
+                  "an access-denied history read exits 1, names the error and prints no "
+                  "report  <-- pinned defect")
+            module["run_powershell"] = lambda script, timeout, what: read_error(
+                "NoMatchingEventsFound,Microsoft.PowerShell.Commands.GetWinEventCommand")
+            code, out, err = cli("--history")
+            check(code == 2 and r"\Jobs\broken" in out and "read 0 run event(s)" in err,
+                  "a log with no matching events is zero events, and the report still runs")
+            code, out, err = cli("--history", "--since-record-id", "50")
+            check("read 0 run event(s); next run can pass --since-record-id 50" in err,
+                  "a watermark read with nothing new hands the same watermark back, not 0")
+            module["run_powershell"] = real_bridge
+            module["read_run_events"] = lambda days, since=0, timeout=120: list(history)
             code, out, err = cli("--lint")
             check(code == 2 and "interactive-only" in out and "start-in-missing" in out
                   and "stock" not in out, "--lint alone lints the live inventory")
@@ -2575,6 +2855,12 @@ def self_test():
                       "--out as %s is refused  <-- pinned defect" % why)
             code, out, err = cli("--lint", loose, "--apply")
             check(code == 64 and "--apply needs --out" in err, "--apply without --out is refused")
+            prefixed = os.path.join(scratch, "prefixed.json")
+            codes = [cli("--lint", loose, "--out", prefixed, prefix)[0]
+                     for prefix in ("--ap", "--app", "--appl")]
+            check(codes == [64] * 3 and not os.path.exists(prefixed),
+                  "a prefix of --apply, such as --ap, is refused and writes nothing"
+                  "  <-- pinned defect")
             code, out, err = cli("--lint", loose, "--out",
                                  os.path.join(scratch, "nope", "x.csv"), "--apply")
             check(code == 1 and "cannot write" in err and "Traceback" not in err,
@@ -2612,6 +2898,14 @@ def self_test():
                                                 ("--format", "xml"), ("--history", "x"))]
             check(usage == [64] * 4,
                   "a usage error exits 64, never 2, which means an Error finding  <-- pinned defect")
+            refused = [cli(*argv) for argv in (("--history", "0"), ("--history", "-3"),
+                                               ("--since-record-id", "5"),
+                                               ("--history", "--since-record-id", "-1"))]
+            check([code for code, out, err in refused] == [64] * 4
+                  and "1 or more" in refused[0][2] and "needs --history" in refused[2][2]
+                  and "0 or more" in refused[3][2],
+                  "--history 0 or less, which matches no event, and --since-record-id without "
+                  "--history or below 0 are usage errors, not an empty history  <-- pinned defect")
             code, out, err = cli("--lint", loose, "--match", "(")
             check(code == 64 and "not a valid regex" in err and "Traceback" not in err,
                   "a bad --match regex is a usage error, not a traceback  <-- pinned defect")
@@ -2625,6 +2919,7 @@ def self_test():
             check(code == 1 and "not reachable" in err, "a failed inventory read exits 1")
         finally:
             module["read_tasks"], module["read_run_events"] = real_readers
+            module["run_powershell"] = real_bridge
     finally:
         shutil.rmtree(scratch)
 
@@ -2702,6 +2997,8 @@ class Parser(argparse.ArgumentParser):
 def main(argv=None):
     parser = Parser(
         prog="taskpulse",
+        # Without this, argparse reads --ap, --app and --appl as --apply: a typed prefix writes.
+        allow_abbrev=False,
         description="Audit every Windows scheduled task and report which ones are silently "
                     "failing, or lint their configuration.",
         epilog="Read-only: taskpulse never modifies, starts, stops or deletes a task, "
@@ -2724,7 +3021,7 @@ def main(argv=None):
     mode.add_argument("--history", nargs="?", type=int, const=30, metavar="DAYS",
                       help="also read the Task Scheduler Operational log and report each "
                            "task's last 7 days of runs and its duration baseline "
-                           "(default: 30 days of events)")
+                           "(default: 30 days of events, newest first)")
     mode.add_argument("--lint", nargs="*", metavar="PATH",
                       help="report configuration findings instead of run health. With no "
                            "PATH, lint the live Task Scheduler; with PATHs, lint exported task "
@@ -2732,9 +3029,11 @@ def main(argv=None):
     parser.add_argument("--local-drives", default="C", metavar="LETTERS",
                         help="with --lint, drive letters that are local disks, not mapped "
                              "drives (default: C)")
-    parser.add_argument("--since-record-id", type=int, default=0, metavar="ID",
-                        help="with --history, read only event records newer than ID. Pass the "
-                             "watermark the previous run printed; the day window is ignored")
+    parser.add_argument("--since-record-id", type=int, metavar="ID",
+                        help="with --history, read only event records newer than ID, oldest "
+                             "first. Pass the watermark the previous run printed. The day "
+                             "window is ignored, and the run columns count only the runs "
+                             "since ID")
     parser.add_argument("--timeout", type=int, default=120, metavar="SECONDS",
                         help="Task Scheduler query timeout (default: 120)")
     parser.add_argument("--self-test", action="store_true",
@@ -2747,6 +3046,14 @@ def main(argv=None):
         parser.error("--match is not a valid regex: %s" % error)
     if args.apply and not args.out:
         parser.error("--apply needs --out")
+    if args.history is not None and args.history < 1:
+        # 0 or less builds a window that matches nothing: an empty history, not an error.
+        parser.error("--history DAYS must be 1 or more")
+    if args.since_record_id is not None and args.history is None:
+        parser.error("--since-record-id needs --history")
+    if (args.since_record_id or 0) < 0:
+        parser.error("--since-record-id must be 0 or more")
+    since = args.since_record_id or 0
     if args.out and args.lint and any(inside(args.out, path) for path in args.lint):
         # One mistyped path would replace the export being linted with its own findings.
         parser.error("--out %s is an export this run lints, or inside one" % args.out)
@@ -2766,19 +3073,45 @@ def main(argv=None):
 
     now = datetime.now(timezone.utc)
     run_summary = {}
+    incomplete = False
     if args.history is not None:
         try:
-            events = read_run_events(args.history, args.since_record_id, args.timeout)
+            events = read_run_events(args.history, since, args.timeout)
         except Exception as error:
             sys.stderr.write("taskpulse: %s\n" % error)
             return 1
-        run_summary = summarize_runs(build_run_rows(events, tasks), now)
+        # The read asks for one event more than the cap, so only a read that left events
+        # unread counts as capped. The events kept are the first ones in read order: the
+        # oldest past a watermark, the newest on a cold start.
+        capped = len(events) > HISTORY_MAX_EVENTS
+        events = events[:HISTORY_MAX_EVENTS]
+        run_summary = summarize_runs(build_run_rows(events, tasks), now, since)
         # Report the watermark over every event fetched, not only the ones that joined to a
-        # task: an event for an unmonitored task is still an event this run has read.
-        watermark = max([to_int(raw.get("event_record_id")) or 0 for raw in events]
-                        + [args.since_record_id])
+        # task: an event for an unmonitored task is still an event this run has read. Past a
+        # watermark the read is oldest first, so every record below the new one has been read.
+        watermark = max([to_int(raw.get("event_record_id")) or 0 for raw in events] + [since])
         sys.stderr.write("taskpulse: read %d run event(s); next run can pass "
                          "--since-record-id %d\n" % (len(events), watermark))
+        times = [parse_dt(raw.get("event_time_utc")) for raw in events]
+        reach = min([when for when in times if when] or [now])
+        if capped and since:
+            incomplete = True
+            sys.stderr.write("taskpulse: the read stopped at the %d-event cap, so newer events "
+                             "were not read and this report is incomplete; the next run "
+                             "continues from that watermark\n" % HISTORY_MAX_EVENTS)
+        elif capped and reach > now - timedelta(days=7):
+            # A clean report here would hide a task whose failures lie in the unread days.
+            incomplete = True
+            sys.stderr.write("taskpulse: the read stopped at the %d-event cap at %s, so the "
+                             "7-day columns miss the older runs and this report is "
+                             "incomplete; pass the watermark to later runs\n"
+                             % (HISTORY_MAX_EVENTS, reach.strftime("%Y-%m-%dT%H:%MZ")))
+        elif capped:
+            sys.stderr.write("taskpulse: the read stopped at the %d-event cap at %s; the 7-day "
+                             "columns are complete, and the duration baseline covers less "
+                             "than %d day(s)\n" % (HISTORY_MAX_EVENTS,
+                                                  reach.strftime("%Y-%m-%dT%H:%MZ"),
+                                                  args.history))
 
     if lint:
         rows = lint_rows(tasks, args.local_drives.split(","), args.show_ok)
@@ -2814,7 +3147,9 @@ def main(argv=None):
                              % args.out)
 
     failed = [row for row in rows if row.get("status", row.get("severity")) == "Error"]
-    return 2 if failed else 0
+    if failed:
+        return 2
+    return 1 if incomplete else 0  # a history taskpulse could not finish is never a clean run
 
 
 if __name__ == "__main__":
