@@ -121,10 +121,10 @@ PASS  importing taskpulse runs nothing and prints nothing
 PASS  the import probe writes no .pyc beside the script  <-- pinned defect
 os message table: present
 --------------------------------------------------------------------
-497 assertions, 0 failed
+500 assertions, 0 failed
 ```
 
-The same command prints `497 assertions, 0 failed` on Windows with Python 3.13 and on Ubuntu
+The same command prints `500 assertions, 0 failed` on Windows with Python 3.13 and on Ubuntu
 with Python 3.12, and on Windows with Python 3.9. On Linux there is no OS message table, so
 the line above the footer rule reads
 `os message table: absent, so its assertions check the unmapped fallback`. Six assertions then
@@ -199,7 +199,7 @@ cd taskpulse
 python taskpulse.py --self-test
 ```
 
-That is the whole setup. `--self-test` runs 497 assertions with no network, no credentials and
+That is the whole setup. `--self-test` runs 500 assertions with no network, no credentials and
 no Task Scheduler access, so it passes on a locked-down box and in CI. Then run
 `python taskpulse.py` for the health report, or `python taskpulse.py --lint` for the lint.
 
@@ -623,11 +623,8 @@ Error, because only the machine knows whether `D:` is a disk or a mapping.
 * **The history exit code is 1, not 2.** A failed history read is a failure of taskpulse
   itself, so it exits `1`, as a failed inventory read does. Exit `2` means a task in `Error`,
   and a failed history read still exits `2` when a task is in `Error`. Then the `history`
-  field, `failed`, tells the two runs apart. The original specification named exit `2` for a
-  failed read, and taskpulse departs from it on purpose. Under Nagios-style checks, exit `1`
-  means WARNING, not UNKNOWN. The specification also named exit `2`
-  for a mistyped flag such as `--ap`. taskpulse exits `64` for every usage error, for the same
-  reason.
+  field, `failed`, tells the two runs apart. Under Nagios-style checks, exit `1` means WARNING,
+  not UNKNOWN. A mistyped flag, such as `--ap`, exits `64`, as every usage error does.
 * **Elevation changes what you see.** Unelevated, tasks in protected folders and tasks owned by
   other users may be missing, or present with no `Get-ScheduledTaskInfo` detail. A task whose
   run details, actions or triggers could not be read is a `Warning`, with "the live read could
@@ -643,13 +640,17 @@ Error, because only the machine knows whether `D:` is a disk or a mapping.
   in one script, so it is short, but it was not measured.
 * **A watermark can be wrong in a way the range cannot show.** After a clear, once the log
   refills and its new record ids pass a saved watermark, the records below it are skipped.
-  This happens only when no run took place between the clear and that point.
+  This happens only when no run took place between the clear and that point. A watermark
+  copied from another server, or saved before a clear, that falls inside this log's current
+  record range is accepted too. The read then starts at the wrong record, and it can skip or
+  re-read records without a warning.
 * **One run can count in two watermark reads.** A read that sees a run's start but not its
   end counts it, and the read that sees the end counts it again, with an estimated start. The
   counts of each read are exact, but a total over several reads can count one run twice.
 * **Only a `201` result marks a failed run.** A run whose action never launched writes no
   `201`, so it reads as `Unknown` and is not counted as a failure. taskpulse does not read the
-  `101`, `103` and `203` launch-failure events.
+  `101`, `103` and `203` launch-failure events. A run that Task Scheduler ends with a `111`
+  event and no `102` or `201` stays `Running`, so it is not counted as a failure either.
 * **The `--history` join is case sensitive.** If the event log spells a task's path in another
   case than the inventory, for example after a re-registration, those runs join to no task and
   are not counted.
@@ -690,9 +691,9 @@ Error, because only the machine knows whether `D:` is a disk or a mapping.
 * **The measured counts are point-in-time.** The 15 `interactive-only` findings and the 20
   findings above were measured once. A rerun on the same machine later gave 16 and 21, because
   its task set changed.
-* **Branch coverage was measured on Windows only.** Coverage is not installed on the Linux
-  host, so the Linux-only branches, such as a missing OS message table, are covered by stubs
-  in the Windows run.
+* **Linux coverage used a separate Python.** Branch coverage is 100 percent on Windows and on
+  Linux. Coverage is not installed for the Linux host's system `python3`, so the Linux
+  measurement ran on a uv-managed Python 3.12.
 * **The quoted self-test run is an excerpt.** Each `...` stands for `PASS` lines left out. Every
   line shown appears in a real run, in that order, and the footer count is the full count.
 * **Application exit codes are opaque.** The OS message table only knows OS codes. A task whose
@@ -728,7 +729,11 @@ Error, because only the machine knows whether `D:` is a disk or a mapping.
 * **The table cuts a cell at 60 characters.** A long `WHY` can lose its `run history unread`
   or `run history incomplete` note in the table. `json` and `csv` keep the whole field.
 * **The log-range read is checked as script text only.** The self-test cannot run PowerShell,
-  so an inverted `RecordCount` test in the history script would go unnoticed offline.
+  so an inverted `RecordCount` test in the history script would go unnoticed offline. The
+  success path against an enabled Operational log was never run, because that log is disabled
+  on the development machine. The script was run live with the Application log in its place.
+  It read oldest first past a watermark and read an empty match as empty. It raised for the
+  Security log, a missing log and a watermark above the newest record.
 * **Starting a watermark at 0 on a log that has rolled over reports a loss once.** The log no
   longer holds its first records, so that first run names them as overwritten and exits `1`.
 * **A run is dated by its start.** On a cold start, a run that began more than 7 days ago and
@@ -742,23 +747,51 @@ Error, because only the machine knows whether `D:` is a disk or a mapping.
 * **A log that was off for a while can look complete.** If the log is disabled, enabled again
   and keeps its old records, a cold start sees an old oldest record. It then calls the 7-day
   columns complete, although runs in the off period were never logged. Whether a disabled log
-  keeps its records was not measured.
+  keeps its records was not measured. If the log is turned off and on again between two
+  watermark runs, the runs in the off period were never logged, and the next watermark read
+  still reports complete.
 * **A log cleared during a read can look clean.** If the log is cleared after the script reads
   its range but before it reads the events, the empty answer reads as a clean history, and
   that run exits `0`. The next watermark run then exits `1`, because its watermark is above
-  the new newest record. If the log is cleared before the range read, no range row comes
-  back, so a run with `--since-record-id 0` reports an empty history and exits `0`.
-* **A partly denied log was not seen to answer "no events".** On a log whose access list
-  lets `-ListLog` report a record count but denies reading the records, the read raised
-  `UnauthorizedAccessException` and failed loudly. A host that answers
-  `NoMatchingEventsFound` there instead was not observed.
+  the new newest record. If the log is cleared before its record count is read, the range row
+  has no record ids. If it is cleared between the record count and the range read, the range
+  read answers `NoMatchingEventsFound`, so no range row comes back. In both cases a run with
+  `--since-record-id 0` reports an empty history and exits `0`, and a cold read is incomplete.
+* **A partly denied log is covered only by a stub.** No log on the test machine let `-ListLog`
+  report a record count but denied reading the records, and changing a log's access list needs
+  elevation. So an `UnauthorizedAccessException` from the event read is covered only by a
+  stub. A host that answers `NoMatchingEventsFound` there instead was not tested.
 * **Check the exit code, not only the JSON.** A failed history read with `--format json` and
-  no task needing attention prints `[]`, the same as a clean run, and exits `1`.
+  no task needing attention prints `[]`, the same as a clean run, and exits `1`. In the table
+  format the same run prints `No tasks need attention.` on stdout and the failure on stderr.
 * **Python 3.9 reads only some timestamp precisions.** On 3.9 a timestamp with 1, 2, 4 or 5
   fractional digits is read as having no time. PowerShell's round-trip format always writes
   7, so real input is not affected.
 * **The self-test needs hard links in its temporary folder.** On a FAT or exFAT temporary
   folder, `os.link` fails, and the self-test stops with an `OSError` instead of a count.
+* **Two encodings are refused.** An export in UTF-16 big-endian with no byte order mark, or in
+  UTF-32, exits `1` with "no <Task> element found" or "not well-formed". Windows never writes
+  these.
+* **Task names are trimmed.** Two tasks whose names differ only by leading or trailing spaces
+  share one row of run history.
+* **The last duration can come from the wrong run.** When two runs of one task have the same
+  start time, the last duration comes from the first one read. When runs of one task overlap,
+  a run with an estimated, late start can outrank a run that really started later. The last
+  duration and the duration ratio are then blank for that read. Both affect only the advisory
+  baseline columns.
+* **Two edges of a capped cold read are not pinned.** If every event read lacks a timestamp,
+  the read counts as reaching back only to now, so it is called incomplete. Real events always
+  carry `TimeCreated`. A read that reaches back exactly 7 days is not tested, because `main`
+  reads the wall clock.
+* **Some self-test assertions compare English text.** The OS message checks, such as "cannot
+  find the file", expect English wording. The self-test is expected to fail on a Windows
+  installation with another display language. This was not tested.
+* **Put the path directly after `--lint`.** `taskpulse --lint --all file.xml` reads `file.xml`
+  as an unrecognised argument and exits `64`. Write `taskpulse --lint file.xml --all`.
+* **A password in the program field is printed.** Only the arguments pass through the
+  secret-switch filter. A hand-built action whose program field is `sync.exe --password x`
+  prints that text in the health report's `target` field and in the `bare-program` lint
+  detail. The Task Scheduler console and `schtasks /tr` both put arguments in their own field.
 * **There is no network path**, so there is nothing to test against a stub server.
 
 ## Contributing

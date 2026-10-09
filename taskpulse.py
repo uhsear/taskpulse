@@ -1998,6 +1998,9 @@ def self_test():
           and log_range_gap(100, span_of(101, 9652), now) is None,
           "a watermark of 0 on an empty log, at the newest record, or just below the oldest is "
           "complete")
+    raises(lambda: log_range_gap(9653, span_of(1, 9652), now),
+           "a watermark one past the newest record raises, so no record is skipped silently",
+           RuntimeError)
     gap = log_range_gap(100, span_of(9001, 9652), now) or ""
     check("records 101 to 9000" in gap and "overwritten" in gap,
           "records past the watermark that the log overwrote make the read incomplete"
@@ -2171,6 +2174,9 @@ def self_test():
     check(windowed["runs_last_7_days"] == 1,
           "a 30-day-old run falls outside the window and a 2-day-old run does not, against "
           "the clock the caller passed  <-- pinned defect")
+    still = summarize_runs([run("2026-07-26T01:00:00Z", None, "Running")], now)[r"\Jobs\etl"]
+    check(still["runs_last_7_days"] == 1 and still["failures_last_7_days"] == 0,
+          "a run still running counts as a run, never as a failure")
     check(windowed["last_duration_seconds"] == 10.0,
           "the newest run's duration wins, whatever order the rows arrive in")
     check(summarize_runs([run("2026-07-21T12:00:00Z", 10.0)], now)[r"\Jobs\etl"][
@@ -2995,6 +3001,12 @@ def self_test():
                 code, out, err = cli("--history", "--match", "etl")
                 check(code == 1 and "miss the older runs" in err,
                       "a capped cold read that reaches back 6.5 days, not 7, is incomplete too")
+                module["read_run_events"] = serve([
+                    ago(1, 102, "n", 30), ago(170, 100, "n", 20), ago(180, 100, "o", 10)])
+                code, out, err = cli("--history", "--match", "etl")
+                check("7-day columns are complete" in err and "miss the older runs" not in err,
+                      "a capped cold read of recent events whose oldest kept event is just over "
+                      "7 days old is complete")
                 module["read_run_events"] = serve(week)
             finally:
                 module["HISTORY_MAX_EVENTS"] = real_cap
@@ -3211,7 +3223,8 @@ def self_test():
             check(code == 0 and __version__ in out, "--version still exits 0")
             module["read_run_events"] = unavailable
             code, out, err = cli("--history", "--match", "etl")
-            check(code == 1 and "not reachable" in err, "a failed history read exits 1")
+            check(code == 1 and "not reachable" in err and "No tasks need attention." in out,
+                  "a failed history read exits 1, though its table reads like a clean run")
             unread = dict(later, task_path="\\Jobs\\", task_name="unread", logon_type="Password",
                           read_errors="run details", last_task_result=None,
                           actions=[{"executable": r"C:\jobs\x.exe", "working_directory": "C:\\"}])
