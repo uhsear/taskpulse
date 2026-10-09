@@ -494,10 +494,17 @@ def split_args(value):
     text = text_of(value)
     if not text:
         return []
+    # Windows' argv parser runs an unclosed quote to the end of the line and the task still
+    # runs, so close it the same way. One whole-line token would skip the secret-switch rule
+    # and print a password in a finding. shlex(posix=False) also opens a quote at '.
     try:
-        return [part.strip() for part in shlex.split(text, posix=False) if part.strip()]
+        words = shlex.split(text, posix=False)
     except ValueError:
-        return [text]
+        try:
+            words = shlex.split(text + '"', posix=False)
+        except ValueError:
+            words = shlex.split(text + "'", posix=False)
+    return [part.strip() for part in words if part.strip()]
 
 
 def extension_of(path_value):
@@ -1710,8 +1717,26 @@ def self_test():
     check(classify_command(r"C:\jobs\nightly.cmd", "") == (r"C:\jobs\nightly.cmd", "BatchScript"),
           "a batch file run directly is classified by its extension")
     check(classify_command("", "") == ("", ""), "an actionless task classifies empty")
-    check(split_args('"unterminated') == ['"unterminated'],
-          "an unbalanced quote keeps the whole argument string rather than raising")
+    check(split_args('"unterminated') == ['"unterminated"'],
+          "an unbalanced quote runs to the end of the line, as windows reads it, never raises")
+    check(split_args(r'--password Hunter2 --out "reports\daily.csv')
+          == ["--password", "Hunter2", "--out", r'"reports\daily.csv"'],
+          "an unclosed trailing quote still splits into words, never one whole-line token  "
+          "<-- pinned defect")
+    check(split_args("--log 'logs\\a \"b") == ["--log", "'logs\\a \"b'"],
+          "an unclosed single quote is closed too, after a double quote fails")
+    for exe, args in ((r"C:\tools\sync.exe", r'--password Hunter2 --out "reports\daily.csv'),
+                      (r"C:\Python39\python.exe",
+                       r'C:\jobs\etl.py --token Hunter2 --log "logs\etl.log')):
+        said = lint_task({"task_name": "t", "task_path": "\\Jobs\\", "logon_type": "Password",
+                          "run_as_user": r"EXAMPLE\svc", "trigger_types": "Daily",
+                          "actions": [{"executable": exe, "arguments": args,
+                                       "working_directory": ""}]})
+        check("Hunter2" not in repr(said) and "Hunter2" not in repr(classify_command(exe, args))
+              and any(row["check"] == "start-in-missing" and row["severity"] == "Error"
+                      for row in said),
+              "an unclosed quote never prints the secret and keeps the start-in-missing error "
+              "(%s)  <-- pinned defect" % exe.split("\\")[-1])
 
     # --- health: the verdict Windows does not compute ---
     base = {"enabled": True, "state": "Ready", "trigger_types": "Daily",
@@ -1946,6 +1971,10 @@ def self_test():
           and history_events([span] + events_in) == (events_in, span)
           and history_events([span] + read_error("NoMatchingEventsFound")) == ([], span),
           "event rows pass through unchanged, and the log's range row is split off")
+    raises(lambda: history_events([span] + read_error(
+        "System.UnauthorizedAccessException,Microsoft.PowerShell.Commands.GetWinEventCommand")),
+        "access denied after a good range probe, the shape the script sends, still raises  "
+        "<-- pinned defect", RuntimeError)
 
     # --- a watermark or a cold start the log itself cannot answer (--history) ---
     def span_of(oldest, newest, days_old=30):
@@ -1981,6 +2010,8 @@ def self_test():
     check("older than now" in (log_range_gap(None, span_of(None, None, None), now) or "")
           and log_range_gap(None, span_of(1, 30, days_old=7), now) is None,
           "a cold start on an empty log is incomplete, and on a log 7 days old is complete")
+    check("incomplete" in (log_range_gap(None, span_of(1, 30, days_old=6.5), now) or ""),
+          "a cold start on a log that holds 6.5 days, not 7, is incomplete too")
 
     # --- which end of the log the event cap keeps (--history) ---
     ids = "(EventID=100 or EventID=102 or EventID=200 or EventID=201)"
@@ -2977,9 +3008,16 @@ def self_test():
             check(code == 0 and "2 of 3 run(s) since record 500 failed" in out,
                   "a watermark run says its columns start at the watermark  <-- pinned defect")
             module["read_run_events"] = real_readers[1]
-            module["run_powershell"] = lambda script, timeout, what: read_error(
-                "System.UnauthorizedAccessException,Microsoft.PowerShell.Commands."
-                "GetWinEventCommand", "Attempted to perform an unauthorized operation.")
+            refused = read_error("System.UnauthorizedAccessException,Microsoft.PowerShell."
+                                 "Commands.GetWinEventCommand",
+                                 "Attempted to perform an unauthorized operation.")
+            module["run_powershell"] = lambda script, timeout, what: [span_of(1, 50)] + refused
+            code, out, err = cli("--history", "--since-record-id", "10", "--match", "etl")
+            check(code == 1 and "UnauthorizedAccessException" in err
+                  and "next run can pass" not in err,
+                  "access denied after the range row exits 1 and never moves the watermark  "
+                  "<-- pinned defect")
+            module["run_powershell"] = lambda script, timeout, what: refused
             code, out, err = cli("--history")
             check(code == 2 and r"\Jobs\broken" in out and "UnauthorizedAccessException" in err
                   and "no run history" in err and "read 0" not in err,

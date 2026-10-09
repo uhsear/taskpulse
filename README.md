@@ -25,10 +25,16 @@ PASS  signed form normalises to unsigned
 ...
 PASS  a secret set in a quoted cmd /c or -Command body never reaches the target  <-- pinned defect
 ...
+PASS  an unclosed trailing quote still splits into words, never one whole-line token  <-- pinned defect
+PASS  an unclosed single quote is closed too, after a double quote fails
+PASS  an unclosed quote never prints the secret and keeps the start-in-missing error (sync.exe)  <-- pinned defect
+PASS  an unclosed quote never prints the secret and keeps the start-in-missing error (python.exe)  <-- pinned defect
+...
 PASS  the history script's catch hands every failed read to python with its error id, never an empty list  <-- pinned defect
 PASS  the history script sends the log's oldest and newest record ahead of the events, and ahead of a failed read's error  <-- pinned defect
 PASS  the history script asks whether the log is enabled before it queries, because a disabled log answers NoMatchingEventsFound  <-- pinned defect
 ...
+PASS  access denied after a good range probe, the shape the script sends, still raises  <-- pinned defect
 PASS  a watermark above the log's newest record, as after a clear, raises, never an empty history  <-- pinned defect
 ...
 PASS  records past the watermark that the log overwrote make the read incomplete  <-- pinned defect
@@ -87,6 +93,7 @@ PASS  a capped cold read that does not reach back 7 days exits 1, never a clean 
 ...
 PASS  the default report keeps a task whose last run was green but whose week was not  <-- pinned defect
 ...
+PASS  access denied after the range row exits 1 and never moves the watermark  <-- pinned defect
 PASS  an access-denied history read names the error, still prints the snapshot and keeps the Error task's exit 2  <-- pinned defect
 PASS  an access-denied history read with no task in Error exits 1, never 0
 PASS  a disabled operational log exits 1 and says so, never a clean week with 0 runs  <-- pinned defect
@@ -114,10 +121,10 @@ PASS  importing taskpulse runs nothing and prints nothing
 PASS  the import probe writes no .pyc beside the script  <-- pinned defect
 os message table: present
 --------------------------------------------------------------------
-490 assertions, 0 failed
+497 assertions, 0 failed
 ```
 
-The same command prints `490 assertions, 0 failed` on Windows with Python 3.13 and on Ubuntu
+The same command prints `497 assertions, 0 failed` on Windows with Python 3.13 and on Ubuntu
 with Python 3.12, and on Windows with Python 3.9. On Linux there is no OS message table, so
 the line above the footer rule reads
 `os message table: absent, so its assertions check the unmapped fallback`. Six assertions then
@@ -192,7 +199,7 @@ cd taskpulse
 python taskpulse.py --self-test
 ```
 
-That is the whole setup. `--self-test` runs 490 assertions with no network, no credentials and
+That is the whole setup. `--self-test` runs 497 assertions with no network, no credentials and
 no Task Scheduler access, so it passes on a locked-down box and in CI. Then run
 `python taskpulse.py` for the health report, or `python taskpulse.py --lint` for the lint.
 
@@ -664,8 +671,12 @@ Error, because only the machine knows whether `D:` is a disk or a mapping.
   measured.
 * **The self-test does not pin a read that returns both events and an error**, because the
   history script cannot produce one.
-* **Output from PowerShell that is neither a JSON object nor a JSON list stops the run with a
-  traceback, not a message.** The exit code is then `1`, never `0`.
+* **Output from PowerShell that is neither a JSON object nor a JSON list stops the run.** A
+  bare JSON string stops it with a traceback, and a bare JSON number with a one-line message.
+  The exit code is then `1`, never `0`.
+* **Empty output from a successful inventory read is taken as a box with no tasks.** If
+  PowerShell exits `0` and prints nothing, the report is empty and exits `0`. A working
+  PowerShell never does this.
 * **With `--since-record-id`, the `*_last_7_days` fields count the runs since that record**,
   whatever their age. The field names do not change.
 * **Non-ASCII task names can be misspelled.** Windows PowerShell 5.1 writes redirected output
@@ -711,7 +722,9 @@ Error, because only the machine knows whether `D:` is a disk or a mapping.
   reaches the console unchanged.
 * **PowerShell is started by its bare name.** Windows looks in the current folder before
   System32, so a `powershell.exe` planted in the folder you run taskpulse from runs instead of
-  the real one. Run taskpulse from a folder that only you can write to.
+  the real one. Windows also searches the folder of the running `python.exe` first, so a
+  `powershell.exe` planted in the Python install folder runs too. Run taskpulse from a folder
+  that only you can write to, with a Python install that only administrators can change.
 * **The table cuts a cell at 60 characters.** A long `WHY` can lose its `run history unread`
   or `run history incomplete` note in the table. `json` and `csv` keep the whole field.
 * **The log-range read is checked as script text only.** The self-test cannot run PowerShell,
@@ -730,6 +743,20 @@ Error, because only the machine knows whether `D:` is a disk or a mapping.
   and keeps its old records, a cold start sees an old oldest record. It then calls the 7-day
   columns complete, although runs in the off period were never logged. Whether a disabled log
   keeps its records was not measured.
+* **A log cleared during a read can look clean.** If the log is cleared after the script reads
+  its range but before it reads the events, the empty answer reads as a clean history, and
+  that run exits `0`. The next watermark run then exits `1`, because its watermark is above
+  the new newest record. If the log is cleared before the range read, no range row comes
+  back, so a run with `--since-record-id 0` reports an empty history and exits `0`.
+* **A partly denied log was not seen to answer "no events".** On a log whose access list
+  lets `-ListLog` report a record count but denies reading the records, the read raised
+  `UnauthorizedAccessException` and failed loudly. A host that answers
+  `NoMatchingEventsFound` there instead was not observed.
+* **Check the exit code, not only the JSON.** A failed history read with `--format json` and
+  no task needing attention prints `[]`, the same as a clean run, and exits `1`.
+* **Python 3.9 reads only some timestamp precisions.** On 3.9 a timestamp with 1, 2, 4 or 5
+  fractional digits is read as having no time. PowerShell's round-trip format always writes
+  7, so real input is not affected.
 * **The self-test needs hard links in its temporary folder.** On a FAT or exFAT temporary
   folder, `os.link` fails, and the self-test stops with an `OSError` instead of a count.
 * **There is no network path**, so there is nothing to test against a stub server.
