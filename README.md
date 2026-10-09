@@ -26,6 +26,7 @@ PASS  signed form normalises to unsigned
 PASS  a secret set in a quoted cmd /c or -Command body never reaches the target  <-- pinned defect
 ...
 PASS  the history script's catch hands every failed read to python with its error id, never an empty list  <-- pinned defect
+PASS  the history script asks whether the log is enabled before it queries, because a disabled log answers NoMatchingEventsFound  <-- pinned defect
 ...
 PASS  past a watermark the read is oldest first, so a backlog is never skipped, and takes no time window  <-- pinned defect
 PASS  a cold start reads the newest events of the DAYS window, so a capped read keeps the current week  <-- pinned defect
@@ -95,10 +96,10 @@ PASS  importing taskpulse runs nothing and prints nothing
 PASS  the import probe writes no .pyc beside the script  <-- pinned defect
 os message table: present
 --------------------------------------------------------------------
-463 assertions, 0 failed
+466 assertions, 0 failed
 ```
 
-The same command prints `463 assertions, 0 failed` on Windows with Python 3.13 and on Ubuntu
+The same command prints `466 assertions, 0 failed` on Windows with Python 3.13 and on Ubuntu
 with Python 3.12, and on Windows with Python 3.9. On Linux there is no OS message table, so
 the line above the footer rule reads
 `os message table: absent, so its assertions check the unmapped fallback`. Six assertions then
@@ -165,7 +166,7 @@ cd taskpulse
 python taskpulse.py --self-test
 ```
 
-That is the whole setup. `--self-test` runs 463 assertions with no network, no credentials and
+That is the whole setup. `--self-test` runs 466 assertions with no network, no credentials and
 no Task Scheduler access, so it passes on a locked-down box and in CI. Then run
 `python taskpulse.py` for the health report, or `python taskpulse.py --lint` for the lint.
 
@@ -179,7 +180,7 @@ no Task Scheduler access, so it passes on a locked-down box and in CI. Then run
 | `--all` | Include Microsoft's own tasks under `\Microsoft\`. Excluded by default because there are roughly 200 of them. |
 | `--show-ok` | Include healthy tasks. By default only `Warning` and `Error` rows print. With `--lint`, each task with no findings gets one `OK` row. |
 | `--match REGEX` | Keep only tasks whose full path matches this regex, case insensitive. |
-| `--history [DAYS]` | Also read the Task Scheduler Operational log and report each task's last 7 days of runs, its failures in that week, and its duration baseline. `DAYS` is the window of events the read searches. The default is `30`, and it must be `7` or more, because the columns cover 7 days. With no watermark, a read takes at most 5000 events, newest first. A log that cannot be read stops the run with exit `1`. Cannot be combined with `--lint`. |
+| `--history [DAYS]` | Also read the Task Scheduler Operational log and report each task's last 7 days of runs, its failures in that week, and its duration baseline. `DAYS` is the window of events the read searches. The default is `30`, and it must be `7` or more, because the columns cover 7 days. With no watermark, a read takes at most 5000 events, newest first. A log that is disabled or cannot be read stops the run with exit `1`. Cannot be combined with `--lint`. |
 | `--since-record-id ID` | With `--history`, read only event records newer than `ID`, oldest first. Pass the watermark the previous run printed, even `0`: `0` reads the whole log, oldest first. The day window is then ignored, and the run columns count the runs since `ID`, not the last 7 days (see [Run history](#run-history)). Without `--history`, or below `0`, it is a usage error. |
 | `--lint [PATH ...]` | Report configuration findings instead of run health. With no `PATH`, lint the live Task Scheduler (Windows). With one or more `PATH`s, lint exported task XML files or folders (any OS). |
 | `--local-drives LETTERS` | With `--lint`, the drive letters that are local disks, comma separated. Default `C`. Any other letter is reported as a possible mapped drive. |
@@ -191,8 +192,9 @@ no Task Scheduler access, so it passes on a locked-down box and in CI. Then run
 Exit codes: `0` when nothing is in an `Error` state, `2` when at least one task is (or, with
 `--lint`, when at least one finding is an `Error`), `1` when taskpulse itself failed, such as
 an unreadable export, a subfolder of a linted folder that cannot be listed or is a symbolic
-link, an Operational log that `--history` cannot read, a `--history` read that the event cap
-stopped short (the report still prints), or an `--out` it could not write, and `64` for a
+link, an Operational log that is disabled or that `--history` cannot read, a `--history` read
+that the event cap stopped before it reached back 7 days, or past a watermark (the report
+still prints), or an `--out` it could not write, and `64` for a
 usage error, such as a
 mistyped flag or an invalid `--match` regex. A flag must be typed in full: a prefix such as
 `--ap` is a usage error, not `--apply`, so a typed prefix cannot write. A usage error never
@@ -201,7 +203,8 @@ a monitoring check. Run the health report and the lint as two checks. A task
 can be healthy today and misconfigured for tomorrow, and the reverse. `--history` can add rows
 to the report, because a task that failed every night this week and succeeded tonight is worth
 printing, but it never makes the exit code `2`: that still follows the current state alone.
-It makes the exit code `1` when the history read fails or is incomplete.
+It makes the exit code `1` when the history read fails or is incomplete, unless a task is in
+`Error`: then the exit code is `2`, and only stderr says that the read was incomplete.
 
 A real health run on the development machine, scoped with `--match`:
 
@@ -337,15 +340,16 @@ the other actions returned, warning codes included. A failed `201` counts at onc
 while the run's later actions still run.
 
 Every history read that succeeds prints, on stderr, how many events it read and the highest
-event record id it saw. A failed read prints its error instead. On a machine where the Operational log has never been enabled that line reads:
+event record id it saw. A failed read prints its error instead, and no report. On a machine
+where the Operational log is disabled, which is the Windows default, the run exits `1`:
 
 ```console
 $ python taskpulse.py --history
-taskpulse: read 0 run event(s); next run can pass --since-record-id 0
+taskpulse: the Task Scheduler Operational log could not be read (LogDisabled): the log is disabled, so it holds no run history; an administrator can enable it with: wevtutil sl Microsoft-Windows-TaskScheduler/Operational /e:true
 ```
 
 That watermark is the point of the second flag. The Operational log is busy. On one server it
-carried roughly 920 events a day, and only about a quarter of them belonged to the monitored
+carried roughly 900 events a day, and only about a quarter of them belonged to the monitored
 tasks. So a 5000-event read reaches back about five days, not the thirty you asked for. Pass
 the printed id back as `--since-record-id`, and the next read takes only the records newer than
 it, oldest first. That holds for `0` too: passed back, it reads the whole log oldest first, so
@@ -367,13 +371,15 @@ The two modes answer different questions:
 
 Things to know before you trust the columns:
 
-* The Operational log is **disabled by default on Windows**. A disabled or empty log answers
-  "No events were found" (`NoMatchingEventsFound`). Only that answer is an empty history:
-  `--history` then reports zero events, and the report falls back to the snapshot. Any other
-  failed read stops the run with exit `1`, prints no report, and names the error. On the
-  development machine, the same query pointed at the Security log, unelevated, stopped with
-  `System.UnauthorizedAccessException`. Pointed at a log that does not exist, it stopped with
-  `NoMatchingLogsFound`.
+* The Operational log is **disabled by default on Windows**. A disabled log answers "No
+  events were found" (`NoMatchingEventsFound`), the same answer as an empty log, even to an
+  invalid query. So the history script first asks the log whether it is enabled
+  (`Get-WinEvent -ListLog`), and a disabled log stops the run with exit `1` and `LogDisabled`.
+  Only `NoMatchingEventsFound` from an enabled log is an empty history: `--history` then
+  reports zero events. Any other failed read stops the run with exit `1`, prints no report,
+  and names the error. On the development machine, unelevated, the script pointed at the
+  Security log stopped with `LogInfoUnavailable` ("Attempted to perform an unauthorized
+  operation"). Pointed at the Application log, which is enabled, it read its events.
 * Past a watermark, events are read oldest first, at most 5000 per run, so the printed
   watermark covers only records that were read. On the Application log with the cap set to 3,
   two runs in a row each read the 3 records just past the watermark they were given. The read
@@ -425,7 +431,7 @@ stock box.
 
 **Re-reading the same events.** The obvious incremental filter is a time window: fetch the last
 thirty days each run. It does not hold, because the fetch is also capped by an event count. That
-log carried roughly 920 events a day on one server, only about a quarter of them from the
+log carried roughly 900 events a day on one server, only about a quarter of them from the
 monitored tasks, so a 5000-event window reached back about five days rather than thirty and the
 rest of the month was silently absent. `--history` filters on `EventRecordID` above a watermark
 instead, which is monotonic and costs nothing to store, and keeps the time window only for the
@@ -437,7 +443,9 @@ and every other failure. Each of them then reads as a quiet week with no failure
 trap is `-FilterHashtable`. Unelevated on Windows 11, a hashtable query of the Security log
 answered `NoMatchingEventsFound`, the same answer as an empty log. The same query written as
 `-LogName` with `-FilterXPath` answered `System.UnauthorizedAccessException`. So taskpulse uses
-only the XPath form, and treats only `NoMatchingEventsFound` as an empty history.
+only the XPath form, and treats only `NoMatchingEventsFound` as an empty history. The third
+trap is the disabled log itself: it answers `NoMatchingEventsFound` too. So taskpulse first
+reads the log's `IsEnabled` flag, and a disabled log is a failed read.
 
 **Reading from the wrong end.** `Get-WinEvent` returns the newest events first. Past a
 watermark, that loses records: `-MaxEvents` keeps the newest 5000, and the next watermark passes
@@ -509,14 +517,11 @@ Error, because only the machine knows whether `D:` is a disk or a mapping.
   clean. There is still no watch mode and no database: `--history` reads the event log once, in
   the same run, and keeps nothing between runs except the watermark you choose to pass back.
 * **`--history` needs the Operational log enabled.** That log is off by default on Windows, and
-  enabling it takes an administrator. With it off, `--history` reports zero events rather than
-  failing. `runs_last_7_days`, `failures_last_7_days` and `is_duration_anomaly` read `0`,
-  and the duration columns stay empty, so a `0` cannot tell "did not run" from "the log
-  could not say". Nothing says that the log is off: stderr shows only `read 0 run event(s)`. A task's history also starts at the moment the
-  log was enabled, not at the moment the task was created. Any read that fails for another
-  reason, such as access denied, exits `1`. An access-denied read of the Operational log itself
-  was not produced. Unelevated on the test machine, where that log is disabled, it answered
-  `NoMatchingEventsFound`. The Security log stood in for the access-denied case.
+  enabling it takes an administrator. With it off, `--history` exits `1` with `LogDisabled`
+  and prints no report. A task's history also starts at the moment the log was enabled, not at
+  the moment the task was created. Any read that fails for another reason, such as access
+  denied, exits `1`. An access-denied read of the Operational log itself was not produced,
+  because that log is disabled on the test machine. The Security log stood in for that case.
 * **A busy log can hide part of the first week.** With no watermark, the read takes the newest
   5000 events. On a log with more than about 700 matching events a day, they do not reach back
   7 days. That run exits `1`, and its columns miss the older runs. Those older runs are never
@@ -533,7 +538,9 @@ Error, because only the machine knows whether `D:` is a disk or a mapping.
   not get its ..." in the `WHY` column, and the lint reports it as `read-failed`. A missing
   task gets no row at all, so the audit is not complete.
 * **A cleared log restarts its record ids.** A saved watermark then sits above every record,
-  and each later run reports an empty history until the ids pass it again.
+  and each later run reports an empty history until the ids pass it again. A
+  `--since-record-id` above the log's newest record, from a cleared log or a typo, reads as an
+  empty history on every run, and taskpulse does not compare it with the log's newest record id.
 * **A log that rolls over can drop records past the watermark.** If the log fills between two
   runs, the oldest records past the saved watermark are lost without a warning. taskpulse does
   not compare the oldest record id still in the log with the watermark.
@@ -548,20 +555,31 @@ Error, because only the machine knows whether `D:` is a disk or a mapping.
   are not counted.
 * **A `--match` that matches no task is a clean run.** It prints `No tasks need attention.` and
   exits `0`, so a check scoped to a renamed, deleted or unreadable task stays green.
-* **The event filter is near the XPath limit.** On the development machine, a filter that named
-  22 event ids ran, and one that named 23 failed with "The specified query is invalid".
-  taskpulse names 4. A longer `HISTORY_EVENT_IDS` would make every `--history` read exit `1`.
+* **The event filter is near the XPath limit.** The limit counts clauses, so it depends on the
+  query form. On the Application log of the development machine, the watermark form ran with
+  22 event ids and failed with 23 ("The specified query is invalid"). The cold-start form,
+  which adds the time window, ran with 21 and failed with 22. taskpulse names 4. A
+  `HISTORY_EVENT_IDS` past the limit would make every `--history` read exit `1`.
 * **An estimated start is late.** A run whose `100` event was not read takes its first event
   read as its start. That time is later than the real start, so a run that started just over
   7 days ago can still count towards the last 7 days.
 * **An event whose XML cannot be parsed is dropped.** It loses its task name and instance id,
-  so it joins to no task, and nothing reports that it was skipped.
+  so it joins to no task, and nothing reports that it was skipped. An event that names no task
+  is dropped in the same way.
 * **One unreadable event fails the whole read.** `-ErrorAction Stop` makes an error on a single
   event stop `Get-WinEvent`, so the run exits `1` rather than skipping that event. This was not
   measured.
-* **A disabled log may hide access denied.** Unelevated, the disabled Operational log on the
-  test machine answered `NoMatchingEventsFound`. If a disabled log is also unreadable, that
-  answer cannot be told from an empty log.
+* **The self-test does not pin a read that returns both events and an error**, because the
+  history script cannot produce one.
+* **Output from PowerShell that is neither a JSON object nor a JSON list stops the run with a
+  traceback, not a message.** The exit code is then `1`, never `0`.
+* **A short log is not reported as incomplete.** A cold read that ends before 7 days ago
+  because the log holds no older records, not because of the cap, is not reported as
+  incomplete. The log can be short because it was enabled recently or rolled over.
+* **With `--since-record-id`, the `*_last_7_days` fields count the runs since that record**,
+  whatever their age. The field names do not change.
+* **A task the live read could not fully read is a `Warning`.** Warnings exit `0`, so a check
+  that reads only the exit code does not see it.
 * **Non-ASCII task names can be misspelled.** Windows PowerShell 5.1 writes redirected output
   in the OEM code page, and taskpulse decodes it as UTF-8. Measured, the accented letter of a
   name arrived as byte `0x82` (code page 437) and decoded as a replacement character. The
@@ -569,6 +587,12 @@ Error, because only the machine knows whether `D:` is a disk or a mapping.
   A `--match` that spells the original name can miss such a task.
 * **The lint example's export is not in the repo.** `gis-tasks.xml` above is a synthetic file
   that is not one of the four files, so you cannot rerun that exact block.
+* **The measured counts are point-in-time.** The 15 `interactive-only` findings and the 20
+  findings above were measured once. A rerun on the same machine later gave 16 and 21, because
+  its task set changed.
+* **Branch coverage was measured on Windows only.** Coverage is not installed on the Linux
+  host, so the Linux-only branches, such as a missing OS message table, are covered by stubs
+  in the Windows run.
 * **The quoted self-test run is an excerpt.** Each `...` stands for `PASS` lines left out. Every
   line shown appears in a real run, in that order, and the footer count is the full count.
 * **Application exit codes are opaque.** The OS message table only knows OS codes. A task whose

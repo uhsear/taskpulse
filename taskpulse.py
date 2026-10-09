@@ -303,7 +303,15 @@ function Get-XmlDataMap {
 # No -ErrorAction SilentlyContinue: it turned every failed read into an empty history. Every
 # failure is handed to Python with its error id, which treats only NoMatchingEventsFound as
 # empty (see history_events).
+#
+# A disabled log also answers NoMatchingEventsFound, even to an invalid query (measured), so
+# it is asked first whether it is on. Off is the Windows default, and an empty answer from it
+# would be a clean week the log never recorded.
 try {
+    if (-not (Get-WinEvent -ListLog $LogName -ErrorAction Stop).IsEnabled) {
+        [pscustomobject]@{ read_error = 'LogDisabled'; message = 'the log is disabled, so it holds no run history; an administrator can enable it with: wevtutil sl Microsoft-Windows-TaskScheduler/Operational /e:true' } | ConvertTo-Json -Compress
+        exit 0
+    }
     $events = @(Get-WinEvent -LogName $LogName -FilterXPath $XPath -MaxEvents $MaxEvents -Oldest:$Oldest -ErrorAction Stop)
 } catch {
     [pscustomobject]@{ read_error = [string]$_.FullyQualifiedErrorId; message = [string]$_.Exception.Message } | ConvertTo-Json -Compress
@@ -1333,8 +1341,9 @@ def history_events(rows):
 
     The history script hands back either its event rows or one {read_error, message} row with
     PowerShell's FullyQualifiedErrorId. Only NoMatchingEventsFound is an empty history: it is
-    what an empty or disabled log gives (measured). Access denied, a missing log or any other
-    failure stops the audit, because a history that could not be read is not a clean week.
+    what an enabled log with no matching events gives. A disabled log (LogDisabled, which the
+    script reports before it queries), access denied, a missing log or any other failure stops
+    the audit, because a history that could not be read is not a clean week.
     """
     failed = [row for row in rows if "read_error" in row]
     if not failed:
@@ -1349,7 +1358,7 @@ def history_events(rows):
 def history_query(days_back, min_record_id):
     """The XPath filter and the read order for one history read. Pure; both take ints only.
 
-    The Operational log is busy: on one server it carried roughly 920 events a day, so
+    The Operational log is busy: on one server it carried roughly 900 events a day, so
     the HISTORY_MAX_EVENTS cap holds about five days. Which end of the match the cap keeps
     decides what is lost.
 
@@ -1375,8 +1384,9 @@ def read_run_events(days_back=30, min_record_id=None, timeout=120):
 
     Oldest first past a watermark, newest first on a cold start (see history_query). It asks
     for one event more than HISTORY_MAX_EVENTS, so the caller can tell a read that filled the
-    cap from one that ended there. An empty or disabled log, which is the Windows default, is
-    an empty history. Any other failed read raises (see history_events). The substituted
+    cap from one that ended there. An enabled log with no matching events is an empty
+    history. A disabled log, which is the Windows default, and any other failed read raise
+    (see history_events). The substituted
     values are built from ints, never text, so nothing a caller types can reach the script as
     PowerShell.
     """
@@ -1821,6 +1831,12 @@ def self_test():
                   "exit 0"],
               "the history script's catch hands every failed read to python with its error id,"
               " never an empty list  <-- pinned defect")
+        probe = history_code.find("(Get-WinEvent -ListLog $LogName -ErrorAction Stop).IsEnabled")
+        check(-1 < probe < history_code.find("-FilterXPath $XPath")
+              and -1 < probe < history_code.find("read_error = 'LogDisabled'")
+              < history_code.find("-ErrorAction Stop)\n} catch {"),
+              "the history script asks whether the log is enabled before it queries, because a "
+              "disabled log answers NoMatchingEventsFound  <-- pinned defect")
         check("-FilterHashtable" not in history_code and "-FilterXPath" in history_code,
               "the history read never uses -FilterHashtable, which reports access denied as no "
               "events  <-- pinned defect")
@@ -1839,7 +1855,11 @@ def self_test():
 
     check(history_events(read_error(
         "NoMatchingEventsFound,Microsoft.PowerShell.Commands.GetWinEventCommand")) == [],
-        "only NoMatchingEventsFound, what an empty or disabled log gives, is an empty history")
+        "only NoMatchingEventsFound, what an enabled log with no matching events gives, is an "
+        "empty history")
+    raises(lambda: history_events(read_error("LogDisabled", "the log is disabled")),
+           "a disabled log raises, never an empty history: off is the windows default  "
+           "<-- pinned defect", RuntimeError)
     raises(lambda: history_events(read_error(
         "System.UnauthorizedAccessException,Microsoft.PowerShell.Commands.GetWinEventCommand")),
         "an access-denied read raises, never an empty history  <-- pinned defect", RuntimeError)
@@ -2835,6 +2855,12 @@ def self_test():
                   and "read 0" not in err,
                   "an access-denied history read exits 1, names the error and prints no "
                   "report  <-- pinned defect")
+            module["run_powershell"] = lambda script, timeout, what: read_error(
+                "LogDisabled", "the log is disabled, so it holds no run history")
+            code, out, err = cli("--history", "--since-record-id", "50")
+            check(code == 1 and out == "" and "(LogDisabled)" in err and "read 0" not in err,
+                  "a disabled operational log exits 1 and says so, never a clean week with 0 "
+                  "runs  <-- pinned defect")
             module["run_powershell"] = lambda script, timeout, what: read_error(
                 "NoMatchingEventsFound,Microsoft.PowerShell.Commands.GetWinEventCommand")
             code, out, err = cli("--history")
