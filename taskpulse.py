@@ -3225,6 +3225,17 @@ def self_test():
             code, out, err = cli("--history", "--match", "etl")
             check(code == 1 and "not reachable" in err and "No tasks need attention." in out,
                   "a failed history read exits 1, though its table reads like a clean run")
+            saved = []
+            for reader in (serve([]), unavailable):
+                module["read_run_events"] = reader
+                path = os.path.join(scratch, "history-%d.json" % len(saved))
+                code = cli("--history", "--match", "etl", "--format", "json", "--out", path,
+                           "--apply")[0]
+                with open(path, "rb") as handle:
+                    saved.append((code, handle.read()))
+            check(saved == [(0, b"[]\n"), (1, b"[]\n")],
+                  "with no row, the --out file of a failed history read matches a clean one, "
+                  "so only the exit code tells them apart  <-- pinned defect")
             unread = dict(later, task_path="\\Jobs\\", task_name="unread", logon_type="Password",
                           read_errors="run details", last_task_result=None,
                           actions=[{"executable": r"C:\jobs\x.exe", "working_directory": "C:\\"}])

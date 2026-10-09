@@ -115,16 +115,17 @@ PASS  a prefix of --apply, such as --ap, is refused and writes nothing  <-- pinn
 PASS  --history 0 or less, which matches no event, and --since-record-id without --history or below 0 are usage errors, not an empty history  <-- pinned defect
 PASS  --history below 7 days is a usage error: a shorter read would still label its columns 'the last 7 days'  <-- pinned defect
 ...
+PASS  with no row, the --out file of a failed history read matches a clean one, so only the exit code tells them apart  <-- pinned defect
 PASS  a task the live read could not fully read exits 1, in the report and the lint, unless a task is in Error  <-- pinned defect
 ...
 PASS  importing taskpulse runs nothing and prints nothing
 PASS  the import probe writes no .pyc beside the script  <-- pinned defect
 os message table: present
 --------------------------------------------------------------------
-500 assertions, 0 failed
+501 assertions, 0 failed
 ```
 
-The same command prints `500 assertions, 0 failed` on Windows with Python 3.13 and on Ubuntu
+The same command prints `501 assertions, 0 failed` on Windows with Python 3.13 and on Ubuntu
 with Python 3.12, and on Windows with Python 3.9. On Linux there is no OS message table, so
 the line above the footer rule reads
 `os message table: absent, so its assertions check the unmapped fallback`. Six assertions then
@@ -199,7 +200,7 @@ cd taskpulse
 python taskpulse.py --self-test
 ```
 
-That is the whole setup. `--self-test` runs 500 assertions with no network, no credentials and
+That is the whole setup. `--self-test` runs 501 assertions with no network, no credentials and
 no Task Scheduler access, so it passes on a locked-down box and in CI. Then run
 `python taskpulse.py` for the health report, or `python taskpulse.py --lint` for the lint.
 
@@ -392,10 +393,15 @@ Each row also has a `history` field, which says how its run columns were read:
   are `null` or empty, and `WHY` says `run history unread`.
 * `incomplete`: the event cap or the log's range left runs unread. The counts are a lower
   bound, and `WHY` says `run history incomplete`.
-* `complete`: the counts are exact. A task with no run in the read counts `0`.
+* `complete`: the read covered the whole period that the counts describe. A task with no
+  run in the read counts `0`. A run that never launched is still not counted as a failure
+  (see Limitations).
 
 A failed read never writes `0` runs and `0` failures. So a saved `--out` file of a failed read
-cannot match the file of a clean read of an empty log.
+differs from the file of a clean read of an empty log only when it holds at least one row. When
+no task needs attention, both files are the same: `[]` in `json`, a header in `csv`, and
+`No tasks need attention.` in the table. Only the exit code tells them apart: `1` for the
+failed read, `0` for the clean one.
 
 Every history read that succeeds prints, on stderr, how many events it read and the watermark
 for the next run. A failed read prints its error instead, and the report prints without run
@@ -586,7 +592,9 @@ Error, because only the machine knows whether `D:` is a disk or a mapping.
   relative path in it is not reported. A quoted `cmd /c` body that starts with a rooted path
   holding a space keeps that path whole only when it ends in a known extension or `.exe`. So
   `cmd /c "C:\my tools\sync --all"` splits at the space and reports `tools\sync` as a relative
-  path, which it does not print.
+  path, which it does not print. A value that ends in a known file extension is printed as a
+  path, even after a one-letter switch. With an empty `Start In`, `python etl.py -p Hunter2.txt`
+  prints `Hunter2.txt` in the `start-in-missing` finding.
 * **A drive-relative bare word is not a drive.** `Z:outbox`, with no dot or separator after
   the colon, reads the same as a tag such as `x:y`, so `mapped-drive` does not report it.
   `Z:\outbox`, `Z:outbox\daily` and `Z:run.log` are reported.
@@ -650,7 +658,9 @@ Error, because only the machine knows whether `D:` is a disk or a mapping.
 * **Only a `201` result marks a failed run.** A run whose action never launched writes no
   `201`, so it reads as `Unknown` and is not counted as a failure. taskpulse does not read the
   `101`, `103` and `203` launch-failure events. A run that Task Scheduler ends with a `111`
-  event and no `102` or `201` stays `Running`, so it is not counted as a failure either.
+  event and no `102` or `201` stays `Running`, so it is not counted as a failure either. So a
+  `complete` read counts exactly the runs that wrote a `201` result. A run that failed to
+  launch is not counted as a failure.
 * **The `--history` join is case sensitive.** If the event log spells a task's path in another
   case than the inventory, for example after a re-registration, those runs join to no task and
   are not counted.
@@ -733,9 +743,23 @@ Error, because only the machine knows whether `D:` is a disk or a mapping.
   success path against an enabled Operational log was never run, because that log is disabled
   on the development machine. The script was run live with the Application log in its place.
   It read oldest first past a watermark and read an empty match as empty. It raised for the
-  Security log, a missing log and a watermark above the newest record.
+  Security log, a missing log and a watermark above the newest record. The PowerShell lines
+  that read the log's oldest and newest record are checked only by a live read, not by the
+  self-test.
+* **An empty record count hides the log's range.** If `Get-WinEvent -ListLog` reports no
+  `RecordCount` for an enabled log that holds records, the range row has no record ids. Then
+  every watermark above `0` exits `1` as above the newest record, and every cold start exits
+  `1` as incomplete. The run is loud, never clean. This was not observed: `RecordCount` was
+  empty only on the disabled log of the development machine.
 * **Starting a watermark at 0 on a log that has rolled over reports a loss once.** The log no
   longer holds its first records, so that first run names them as overwritten and exits `1`.
+* **The clock is read a few seconds before the log.** On a cold start, the 7-day columns count
+  back from a clock read that `main` takes before the history script starts. The script's time
+  window counts back from the moment its query runs, a few seconds later. So with
+  `--history 7`, a short run that falls entirely in those first seconds of the week is not read.
+* **An event with no usable time is ignored for timing.** It still joins its run and can carry
+  a `201` result. No self-test case mixes such an event with dated events of the same run.
+  Real events always carry `TimeCreated`.
 * **A run is dated by its start.** On a cold start, a run that began more than 7 days ago and
   failed inside the last 7 days is left out of that week's failures.
 * **An out-of-range `--since-record-id` or `DAYS` fails the history read.** A value such as
@@ -764,6 +788,7 @@ Error, because only the machine knows whether `D:` is a disk or a mapping.
 * **Check the exit code, not only the JSON.** A failed history read with `--format json` and
   no task needing attention prints `[]`, the same as a clean run, and exits `1`. In the table
   format the same run prints `No tasks need attention.` on stdout and the failure on stderr.
+  Its `--out` file is the same as the file of a clean run.
 * **Python 3.9 reads only some timestamp precisions.** On 3.9 a timestamp with 1, 2, 4 or 5
   fractional digits is read as having no time. PowerShell's round-trip format always writes
   7, so real input is not affected.
