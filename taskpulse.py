@@ -18,8 +18,9 @@ C:\\Windows\\System32\\Tasks), --lint needs no Task Scheduler and runs on any OS
 failed (events 101, 103, 203), a run the scheduler or a person ended (111, 329, 330) and a
 launch that was refused (153, 322, 332). A run that never finishes is STUCK. A task whose latest
 launch was refused is BLOCKED. --diff OLD NEW compares two exports of the same tasks and names
-each field that changed, with the Task Scheduler schema defaults applied, so an element that
-was absent in one export and explicit in the other is no change.
+each field that changed, with the Task Scheduler schema defaults applied, so a setting that was
+absent in one export and written at its default in the other is no change. It prints no
+arguments unless --show-args is given, because they can hold secrets.
 
 What it refuses to do:
 
@@ -238,17 +239,20 @@ DRIVE = re.compile(r"(?<![A-Za-z0-9_])([A-Za-z]):(?=[\\/\s\"']|$|[^\s\"':]*[.\\/
 XML_DECL = re.compile(r"<\?xml[^>]*\?>")
 SYSTEM32 = "C:\\Windows\\System32"
 # What Task Scheduler assumes for a Settings element that an export leaves out. Every value is
-# the default="..." of settingsType in the Task Scheduler schema, except ExecutionTimeLimit: the
-# schema gives it none, and the ITaskSettings documentation says "By default, a task will be
-# stopped 72 hours after it starts to run". Windows writes most of these explicitly, so an
-# absent element mostly means a hand-written export. The principal's LogonType and RunLevel
-# have no documented default, so they get none here.
+# the default="..." of settingsType in the Task Scheduler schema, except two. ExecutionTimeLimit:
+# the schema gives it none, and the ITaskSettings documentation says "By default, a task will be
+# stopped 72 hours after it starts to run". DeleteExpiredTaskAfter is left out on purpose: its
+# schema default is PT0S (delete at once), but its element page says "If no value is specified
+# for this element, then the Task Scheduler service will not delete the task", so an absent
+# element and PT0S are opposite behaviours and must diff as a change. Windows writes most of
+# these explicitly, so an absent element mostly means a hand-written export. The principal's
+# LogonType and RunLevel have no documented default, so they get none here.
 SETTING_DEFAULTS = {
     "AllowStartOnDemand": "true", "MultipleInstancesPolicy": "IgnoreNew",
     "DisallowStartIfOnBatteries": "true", "StopIfGoingOnBatteries": "true",
     "AllowHardTerminate": "true", "StartWhenAvailable": "false",
     "RunOnlyIfNetworkAvailable": "false", "WakeToRun": "false", "Enabled": "true",
-    "Hidden": "false", "DeleteExpiredTaskAfter": "PT0S", "Priority": "7",
+    "Hidden": "false", "Priority": "7",
     "RunOnlyIfIdle": "false", "UseUnifiedSchedulingEngine": "false",
     "DisallowStartOnRemoteAppSession": "false", "ExecutionTimeLimit": "PT72H",
 }
@@ -1117,12 +1121,14 @@ def build_block_rows(events, tasks):
 def judge_fates(run_rows, block_rows, tasks, now, since_record_id=None, stuck_hours=STUCK_HOURS):
     """STUCK, BLOCKED or neither for each task that has a run or a refused launch. Pure.
 
-    STUCK: a run has no end event, and the task's own state does not say otherwise, and either
-    the run began `stuck_hours` or more ago, or a later launch was refused because it was still
-    running (event 322). A task whose state is Running and whose last launch was `stuck_hours`
-    or more ago is STUCK too, even when this read holds no start event for that run. A task whose state is Ready or Queued is not running, so a run with no
-    end event is a lost end event, not a stuck run. A state that is missing, as in an XML
-    export, does not rule a run out.
+    STUCK: a run has no end event, and the task's own state does not say otherwise, and the run
+    began `stuck_hours` or more ago. Later launches that were refused because it was still
+    running (event 322) are counted in the detail, but they do not make a young run STUCK: a
+    healthy job that runs longer than its repeat interval draws a 322 for every trigger. A task
+    whose state is Running and whose last launch was `stuck_hours` or more ago is STUCK too,
+    even when this read holds no start event for that run. A task whose state is Ready or Queued
+    is not running, so a run with no end event is a lost end event, not a stuck run. A state
+    that is missing, as in an XML export, does not rule a run out.
 
     BLOCKED: not stuck, and the latest launch refused inside the window came after the task's
     latest start in this read, so nothing has run since. The window is the one the run columns
@@ -1153,7 +1159,7 @@ def judge_fates(run_rows, block_rows, tasks, now, since_record_id=None, stuck_ho
                 waiting = len([row for row in refused if row["kind"] == "overlap"
                                and row["instance_id"] == run["instance_id"]])
                 hours = (now - started).total_seconds() / 3600.0
-                if waiting or hours >= stuck_hours:
+                if hours >= stuck_hours:
                     stuck.append((hours, waiting))
             # The scheduler's own word: Running since a launch long ago, whether or not this
             # read holds that run's start event (the log may be shorter than --history).
@@ -1799,8 +1805,14 @@ def mask_arguments(arguments, program=""):
     return " ".join(words)
 
 
-def describe_action(action):
-    """(compare key, shown text) of one child of Actions. The text masks secrets."""
+def describe_action(action, show_args=False):
+    """(compare key, shown text) of one child of Actions.
+
+    The arguments are compared always, but the text leaves them out unless `show_args` is set:
+    a mask is a blacklist of known secret shapes, and a credential in a shape it does not know
+    (a token in a URL path, a bare positional password) would print. With `show_args` the text
+    holds the arguments with the mask applied, which is a second layer, not a guarantee.
+    """
     fields = dict(action["leaves"])
     if action["kind"] != "Exec":
         return (action["kind"], tuple(action["leaves"])), (
@@ -1808,8 +1820,11 @@ def describe_action(action):
     command = fields.get("Command", "")
     args = fields.get("Arguments", "")
     start = fields.get("WorkingDirectory", "")
-    shown = "Exec " + " ".join(part for part in (
-        mask_arguments(command), mask_arguments(args, program_name(command))) if part)
+    if show_args:
+        shown_args = mask_arguments(args, program_name(command))
+    else:
+        shown_args = "[arguments not shown]" if args else ""
+    shown = "Exec " + " ".join(part for part in (mask_arguments(command), shown_args) if part)
     return (command.lower(), args, start.lower()), shown + (
         " [Start In %s]" % start if start else "")
 
@@ -1843,14 +1858,14 @@ def unmatched(old, new):
     return list(zip_longest([item[1] for item in gone], [item[1] for item in rest], fillvalue=""))
 
 
-def compare_tasks(old, new):
+def compare_tasks(old, new, show_args=False):
     """(field, old shown, new shown) for each difference between two parses of one task.
 
     Compared: the account, its logon type and run level; each Settings element, with the schema
     default for one that only a side leaves out; the triggers, in any order; and the actions, in
     order. Not compared: RegistrationInfo (date, author, description), which changes on every
-    re-registration and does not change what runs. An argument that holds a secret is masked,
-    and a change to one that the mask hides says so.
+    re-registration and does not change what runs. Arguments are compared but not printed
+    unless `show_args` is set (see describe_action); a change to a hidden one says so.
     """
     changes = []
 
@@ -1877,8 +1892,8 @@ def compare_tasks(old, new):
     for gone, added in unmatched([describe_trigger(t) for t in old.get("trigger_details") or []],
                                  [describe_trigger(t) for t in new.get("trigger_details") or []]):
         changes.append(("trigger", gone, added))
-    was = [describe_action(a) for a in old.get("action_details") or []]
-    now = [describe_action(a) for a in new.get("action_details") or []]
+    was = [describe_action(a, show_args) for a in old.get("action_details") or []]
+    now = [describe_action(a, show_args) for a in new.get("action_details") or []]
     for index in range(max(len(was), len(now))):
         differ("action %d" % (index + 1), was[index] if index < len(was) else ("", ""),
                now[index] if index < len(now) else ("", ""))
@@ -1890,7 +1905,7 @@ def compare_tasks(old, new):
     return changes
 
 
-def diff_tasks(old_tasks, new_tasks):
+def diff_tasks(old_tasks, new_tasks, show_args=False):
     """One row per difference between two sets of parsed tasks, tasks in name order. Pure.
 
     A task is matched by its full name, ignoring case, as Windows does. A task in only one set
@@ -1907,7 +1922,7 @@ def diff_tasks(old_tasks, new_tasks):
             continue
         rows.extend({"change": "changed", "task": full_task_name(news[key]), "field": field,
                      "old": before, "new": after}
-                    for field, before, after in compare_tasks(olds[key], news[key]))
+                    for field, before, after in compare_tasks(olds[key], news[key], show_args))
     return rows
 
 
@@ -2593,6 +2608,9 @@ def self_test():
           "history  <-- pinned defect")
     raises(lambda: log_range_gap(5, span_of(None, None, None), now),
            "a watermark into a log with no record at all raises too", RuntimeError)
+    raises(lambda: log_range_gap(1, span_of(None, None, None), now),
+           "a watermark of 1 on an empty log raises: only 0 is a complete read of nothing",
+           RuntimeError)
     check(log_range_gap(0, span_of(None, None, None), now) is None
           and log_range_gap(9652, span_of(1, 9652), now) is None
           and log_range_gap(100, span_of(101, 9652), now) is None,
@@ -2995,12 +3013,18 @@ def self_test():
           "only a run with no end is stuck: a finished run is not, however old")
     check(go(0)["fate"] == "",
           "a run row with no usable start time is skipped, not a crash")
-    waiting = go(2, blocks=[refusal("overlap", 1, "r1"), refusal("overlap", 0.5, "r1")])
+    healthy = go(2, blocks=[refusal("overlap", 1, "r1"), refusal("overlap", 0.5, "r1")])
+    check(healthy["fate"] == "BLOCKED" and "event 322" in healthy["detail"]
+          and "STUCK" not in healthy["detail"] and healthy["blocked_launches"] == 2,
+          "a run that is only 2 hours old is not STUCK although later launches were ignored "
+          "while it ran: a slow job on a short repeat interval is healthy  <-- pinned defect")
+    waiting = go(30, blocks=[refusal("overlap", 1, "r1"), refusal("overlap", 0.5, "r1")])
     check(waiting["fate"] == "STUCK" and "2 later launch(es) were ignored while it ran (event 322)"
-          in waiting["detail"] and "2.0 hour(s) ago" in waiting["detail"]
+          in waiting["detail"] and "30.0 hour(s) ago" in waiting["detail"]
           and waiting["blocked_launches"] == 2,
-          "a run that is only 2 hours old is STUCK when later launches were ignored because it "
-          "was still running (event 322)  <-- pinned defect")
+          "a run past the threshold with ignored launches is STUCK, and the detail counts them")
+    check("ignored" not in go(30)["detail"],
+          "a stuck run that drew no 322 does not claim ignored launches")
     check(go(2, blocks=[refusal("overlap", 1, "other")])["fate"] == "BLOCKED",
           "a 322 that names another instance does not make this run stuck; it blocks the task")
     check(go(2, blocks=[refusal("no-session", 1)])["fate"] == "BLOCKED",
@@ -3022,6 +3046,9 @@ def self_test():
           "a task the scheduler says is Running since a launch 24 hours or more ago is STUCK "
           "although this read holds no start event for the run; Ready, Queued and a missing "
           "launch time are not  <-- pinned defect")
+
+    check(running_since(290)["detail"] == "STUCK: a run started 290.0 hour(s) ago has not finished",
+          "a Running task with no run row claims no ignored launches")
 
     def finished(started, blocks, **options):
         """judge_fates for a task whose only run began `started` hours ago and ended."""
@@ -3045,6 +3072,12 @@ def self_test():
           and "event 332" in finished(10, [refusal("overlap", 6, "g"),
                                            refusal("no-session", 5)])["detail"],
           "the latest refusal names the cause, whatever order the rows arrive in")
+    check(finished(10, [refusal("no-session", 7 * 24)])["blocked_launches"] == 1
+          and finished(10, [refusal("no-session", 7 * 24 + 0.01)])["blocked_launches"] == 0
+          and finished(10, [refusal("no-session", 10)])["fate"] == ""
+          and finished(10, [refusal("no-session", 9.99)])["fate"] == "BLOCKED",
+          "a refusal exactly 7 days old is counted and one a moment older is not; a refusal at "
+          "the very second of the last start is not BLOCKED and one just after is")
     only = judge_fates([], [refusal("missed", 5)], [inventory[0]], stuck_now)[r"\Jobs\etl"]
     check(only["fate"] == "BLOCKED" and only["blocked_launches"] == 1,
           "a task with a refused launch and no run at all is BLOCKED")
@@ -3901,8 +3934,9 @@ def self_test():
     def parsed(**kwargs):
         return parse_task_xml(task_xml(**kwargs))
 
-    def changes(before, after):
-        return [(r["change"], r["field"], r["old"], r["new"]) for r in diff_tasks(before, after)]
+    def changes(before, after, show_args=False):
+        return [(r["change"], r["field"], r["old"], r["new"])
+                for r in diff_tasks(before, after, show_args)]
 
     check(diff_tasks(parsed(), parsed()) == [] and diff_tasks([], []) == [],
           "two exports of one task differ in nothing")
@@ -3917,6 +3951,13 @@ def self_test():
                  "<Priority>7</Priority>", limit="PT72H")) == [],
           "a setting written out at its default, in any case, equals one left out  "
           "<-- pinned defect")
+    check(changes(parsed(), parsed(settings="<DeleteExpiredTaskAfter>PT0S</DeleteExpiredTaskAfter>"))
+          == [("changed", "setting DeleteExpiredTaskAfter", "", "PT0S")]
+          and diff_tasks(parsed(settings="<DeleteExpiredTaskAfter>PT0S</DeleteExpiredTaskAfter>"),
+                         parsed(settings="<DeleteExpiredTaskAfter>PT0S</DeleteExpiredTaskAfter>"))
+          == [],
+          "a task that gains DeleteExpiredTaskAfter PT0S is a change: Microsoft says an absent "
+          "element means the task is never deleted, and PT0S deletes it at once  <-- pinned defect")
     check(diff_tasks(parsed(logon="Interactive", user="EXAMPLE\\SVC-ETL"),
                      parsed(logon="InteractiveToken")) == []
           and diff_tasks(parsed(logon="InteractiveTokenOrPassword"), parsed(logon="Password"))
@@ -3981,14 +4022,23 @@ def self_test():
                                                             tzinfo=timezone.utc),
           "a timestamp past the last UTC instant is None, not an OverflowError  "
           "<-- pinned defect")
-    check(changes(parsed(), parsed(command=r"C:\Python311\python.exe")) == [
+    check(changes(parsed(), parsed(command=r"C:\Python311\python.exe"), True) == [
         ("changed", "action 1", r"Exec C:\Python39\python.exe C:\jobs\refresh.py [Start In "
          r"C:\jobs]", r"Exec C:\Python311\python.exe C:\jobs\refresh.py [Start In C:\jobs]")]
-        and changes(parsed(), parsed(arguments=r"C:\jobs\refresh.py --days 30"))[0][3].endswith(
-            r"refresh.py --days 30 [Start In C:\jobs]")
+        and changes(parsed(), parsed(arguments=r"C:\jobs\refresh.py --days 30"),
+                    True)[0][3].endswith(r"refresh.py --days 30 [Start In C:\jobs]")
         and changes(parsed(start="C:\\jobs"), parsed(start="C:\\JOBS")) == [],
-        "a changed program or argument is one row for that action, and a Start In in another "
-        "case is no change")
+        "with --show-args, a changed program or argument is one row for that action, and a "
+        "Start In in another case is no change")
+    check(changes(parsed(), parsed(command=r"C:\Python311\python.exe")) == [
+        ("changed", "action 1", r"Exec C:\Python39\python.exe [arguments not shown] [Start In "
+         r"C:\jobs]", r"Exec C:\Python311\python.exe [arguments not shown] [Start In C:\jobs]")]
+        and changes(parsed(), parsed(arguments=r"C:\jobs\refresh.py --days 30")) == [
+            ("changed", "action 1", r"Exec C:\Python39\python.exe [arguments not shown] "
+             r"[Start In C:\jobs]", r"Exec C:\Python39\python.exe [arguments not shown] "
+             r"[Start In C:\jobs] (a value changed that is not printed)")],
+        "by default the arguments are compared but not printed, and a changed one says so  "
+        "<-- pinned defect")
     two = parse_task_xml(task_xml().replace(
         "</Exec></Actions>", "</Exec><Exec><Command>C:\\jobs\\after.bat</Command></Exec>"
                              "</Actions>"))
@@ -4146,9 +4196,9 @@ def self_test():
           "the value of -P, -p and --auth is masked, and --author and other letters are not  "
           "<-- pinned defect")
 
-    def secretive(args, command="C:\\jobs\\tool.exe"):
+    def secretive(args, command="C:\\jobs\\tool.exe", show_args=True):
         return changes(parsed(command=command, arguments=args[0]),
-                       parsed(command=command, arguments=args[1]))
+                       parsed(command=command, arguments=args[1]), show_args)
 
     shown = []
     for pair_of_args, command in (
@@ -4165,7 +4215,8 @@ def self_test():
         for fmt in ("table", "csv", "json"):
             out = io.StringIO()
             write_output(diff_tasks(parsed(command=command, arguments=pair_of_args[0]),
-                                    parsed(command=command, arguments=pair_of_args[1])),
+                                    parsed(command=command, arguments=pair_of_args[1]),
+                                    show_args=True),
                          fmt, out, diff=True)
             leaked = [word for word in ("Hunter2", "Hunter3", "abc123", "abc124", "Secret9", "QUJD",
                                         "Pa55word", "Pa66word", "PGPASSWORD=Hunter")
@@ -4176,6 +4227,27 @@ def self_test():
               for rows in shown),
           "a change to a secret is reported as a change, with the value left out  "
           "<-- pinned defect")
+
+    # Shapes the mask does not know. The default diff never prints arguments, so none can leak.
+    unknown = (
+        ("https://hooks.example.com/services/T0AAAAAAA/B0BBBBBBB/Zq9XvR2mLpW4sTn8", "curl.exe"),
+        ("-c \"import svc; svc.login('Zq9XvR2mLpW4sTn8')\"", "python.exe"),
+        ("etl.py Zq9XvR2mLpW4sTn8", "python.exe"),
+        ("scott/Zq9XvR2mLpW4sTn8@db @run.sql", "sqlplus.exe"),
+        ("--dsn Zq9XvR2mLpW4sTn8 --pin 4471", "etl.exe"),
+        ("-Command \"$p = 'Zq9XvR2mLpW4sTn8'; Connect-Svc -Password (ConvertTo-SecureString "
+         "'Zq9XvR2mLpW4sTn8' -AsPlainText)\"", "powershell.exe"),
+        ("/c start /b run.bat Zq9XvR2mLpW4sTn8", "cmd.exe"))
+    for index, (line, command) in enumerate(unknown):
+        for fmt in ("table", "csv", "json"):
+            out = io.StringIO()
+            write_output(diff_tasks(parsed(command=command, arguments=line),
+                                    parsed(command=command, arguments=line + "x")),
+                         fmt, out, diff=True)
+            check("Zq9X" not in out.getvalue() and "4471" not in out.getvalue()
+                  and "(a value changed that is not printed)" in out.getvalue(),
+                  "a secret in a shape the mask does not know, %d, stays out of the %s diff and "
+                  "the change is still reported  <-- pinned defect" % (index + 1, fmt))
 
     diff_out = io.StringIO()
     write_output(diff_tasks(parsed(limit="PT1H"), parsed(limit="PT0S")), "table", diff_out,
@@ -4652,6 +4724,23 @@ def self_test():
             check(code == 2 and out.startswith("CHANGE") and "setting ExecutionTimeLimit" in out
                   and "logon type" in out and r"\Jobs\nightly" in out and err == "",
                   "--diff names each field that changed between two exports and exits 2")
+            args_old = os.path.join(scratch, "args-old.xml")
+            args_new = os.path.join(scratch, "args-new.xml")
+            for path, secret in ((args_old, "Zq9XvR2mLpW4sTn8"), (args_new, "Nw3KdF8sQzP1vB6y")):
+                with open(path, "wb") as handle:
+                    handle.write(task_xml(uri="\\Jobs\\nightly", arguments="etl.py " + secret
+                                          ).encode("utf-8"))
+            code, out, err = cli("--diff", args_old, args_new, "--format", "json")
+            check(code == 2 and "Zq9X" not in out + err and "Nw3K" not in out + err
+                  and "arguments not shown" in out and "action 1" in out,
+                  "--diff prints no arguments by default, and still exits 2 on a changed one"
+                  "  <-- pinned defect")
+            code, out, err = cli("--diff", args_old, args_new, "--show-args")
+            check(code == 2 and "etl.py" in out and "[Start In" in out,
+                  "--show-args prints the arguments of each action")
+            code, out, err = cli("--lint", loose, "--show-args")
+            check(code == 64 and "--show-args needs --diff" in err,
+                  "--show-args without --diff is a usage error")
             code, out, err = cli("--diff", old_export, old_export)
             check(code == 0 and out == "No differences.\n",
                   "--diff of an export with itself says so and exits 0")
@@ -5052,6 +5141,11 @@ def main(argv=None):
                       help="compare two exports of the same tasks (files or folders, any OS) "
                            "and name each field that changed. Exits 0 when they match, 2 "
                            "when they differ")
+    parser.add_argument("--show-args", action="store_true",
+                        help="with --diff, print each action's arguments. They can hold a "
+                             "secret that the mask does not know, and a change shows both the "
+                             "old and the new value, so do not paste or commit the output "
+                             "(default: arguments are compared but not printed)")
     parser.add_argument("--local-drives", default="C", metavar="LETTERS",
                         help="with --lint, drive letters that are local disks, not mapped "
                              "drives (default: C)")
@@ -5075,6 +5169,8 @@ def main(argv=None):
         parser.error("--match is not a valid regex: %s" % error)
     if args.apply and not args.out:
         parser.error("--apply needs --out")
+    if args.show_args and args.diff is None:
+        parser.error("--show-args needs --diff")
     if args.history is not None and args.history < 7:
         # The run columns cover 7 days. A shorter window would read fewer days and still label
         # them 'the last 7 days', so a failure 5 nights ago would vanish from a clean report.
@@ -5121,7 +5217,7 @@ def main(argv=None):
                 sys.stderr.write("taskpulse: %s holds more than one task named %s; compare one "
                                  "export of each task\n" % (path, name))
                 return 1
-        rows = diff_tasks(*sides)
+        rows = diff_tasks(sides[0], sides[1], args.show_args)
         rows = [row for row in rows if pattern.search(row["task"])]
         return emit(rows, args, diff=True) or (2 if rows else 0)
 
