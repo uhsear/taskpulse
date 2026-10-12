@@ -100,6 +100,8 @@ PASS  cmd cannot cd to a share  <-- pinned defect
 PASS  a cd to a relative folder resolves against System32 itself  <-- pinned defect
 PASS  a Set-Location to a relative folder resolves against System32 itself  <-- pinned defect
 ...
+PASS  a quote opens in the middle of a word, an apostrophe inside a name does not, and an unclosed quote is closed at the end of the line  <-- pinned defect
+...
 PASS  a secret in the Command field is masked in the lint finding and in the target, and a path with spaces is not touched  <-- pinned defect
 ...
 PASS  utf-8 bytes whose declaration still says UTF-16 parse  <-- pinned defect
@@ -121,6 +123,10 @@ PASS  a timestamp past the last UTC instant is None, not an OverflowError  <-- p
 ...
 PASS  a logon change on a task that runs ArcGIS Pro's Python also names the licence conditions  <-- pinned defect
 ...
+PASS  a quoted or attached secret, a net command inside a cmd /c body, curl's -u and -H, -pSECRET, --pswd, --cred, --signature and -EncodedCommand are all masked  <-- pinned defect
+...
+PASS  --diff of a net use inside cmd /c prints neither password  <-- pinned defect
+...
 PASS  the password in a URL is masked, wherever the URL sits, and a URL with no password is not touched  <-- pinned defect
 ...
 PASS  the value of -P, -p and --auth is masked, and --author and other letters are not  <-- pinned defect
@@ -130,6 +136,8 @@ PASS  a change to a secret is reported as a change, with the value left out  <--
 ...
 PASS  a subfolder the walk cannot list stops the read, not a clean lint  <-- pinned defect
 PASS  a subfolder that is a symbolic link, which the walk lists but never enters, stops the read  <-- pinned defect
+...
+PASS  the health report --match that matches no task is not 'No tasks need attention'  <-- pinned defect
 ...
 PASS  a capped cold read that does not reach back 7 days exits 1, never a clean report  <-- pinned defect
 ...
@@ -157,6 +165,8 @@ PASS  --out as a hard link to the export is refused  <-- pinned defect
 ...
 PASS  a prefix of --apply, such as --ap, is refused and writes nothing  <-- pinned defect
 ...
+PASS  --diff --match that matches no task is not a clean diff  <-- pinned defect
+...
 PASS  --diff of two exports that hold only Microsoft's own tasks has no result: exit 1 and a notice, never 'No differences'  <-- pinned defect
 ...
 PASS  --lint of an export that holds only Microsoft's own tasks has no result: exit 1 and a notice, never 'No findings'  <-- pinned defect
@@ -175,10 +185,10 @@ PASS  importing taskpulse runs nothing and prints nothing
 PASS  the import probe writes no .pyc beside the script  <-- pinned defect
 os message table: present
 --------------------------------------------------------------------
-653 assertions, 0 failed
+677 assertions, 0 failed
 ```
 
-The same command prints `653 assertions, 0 failed` on Windows with Python 3.13, 3.12 and 3.9, and
+The same command prints `677 assertions, 0 failed` on Windows with Python 3.13, 3.12 and 3.9, and
 on Ubuntu with Python 3.12. On Linux there is no OS message table, so the line above the footer
 rule reads `os message table: absent, so its assertions check the unmapped fallback`. Six
 assertions then check the `unmapped result 0x...` text instead of the Windows wording, and the
@@ -295,8 +305,8 @@ cd taskpulse
 python taskpulse.py --self-test
 ```
 
-That is the whole setup. `--self-test` runs 653 assertions with no network, no credentials and
-no Task Scheduler access, so it passes on a locked-down box and in CI. Then run
+That is the whole setup. `--self-test` runs 677 assertions with no network, no credentials and
+no Task Scheduler access, so it passes on a locked-down box. Then run
 `python taskpulse.py` for the health report, `python taskpulse.py --lint` for the lint, or
 `python taskpulse.py --diff old.xml new.xml` to compare two exports.
 
@@ -309,7 +319,7 @@ no Task Scheduler access, so it passes on a locked-down box and in CI. Then run
 | `--apply` | Write `--out`. Without it nothing is written, and the report goes to stdout. |
 | `--all` | Include Microsoft's own tasks under `\Microsoft\`. Excluded by default because there are so many. This holds for `--lint PATH` and `--diff` too: they skip those tasks in the files they read, print how many on stderr, and exit `1` when none was left. |
 | `--show-ok` | Include healthy tasks. By default only `Warning` and `Error` rows print. With `--lint`, each task with no findings gets one `OK` row. |
-| `--match REGEX` | Keep only tasks whose full path matches this regex, case insensitive. |
+| `--match REGEX` | Keep only tasks whose full path matches this regex, case insensitive. When it matches no task at all, nothing was examined: taskpulse says so on stderr and exits `1`, with no output, so a check scoped to a renamed or deleted task does not stay green. |
 | `--history [DAYS]` | Also read the Task Scheduler Operational log and report each task's last 7 days of runs, its failures in that week, its duration baseline, and whether it is `STUCK` or `BLOCKED` (see [Run fate](#run-fate)). `DAYS` is the window of events the read searches. The default is `30`, and it must be `7` or more, because the columns cover 7 days. With no watermark, a read takes at most 5000 events, newest first. A log that is disabled or cannot be read leaves the report without run history and makes the exit code `1`, or `2` when a task is in `Error`. Cannot be combined with `--lint` or `--diff`. |
 | `--stuck-hours HOURS` | With `--history`, a run with no end event after this many hours is `STUCK`. Default `24`. It must be `1` or more. Without `--history`, it is a usage error. |
 | `--since-record-id ID` | With `--history`, read only event records newer than `ID`, oldest first. Pass the watermark the previous run printed, even `0`: `0` reads the whole log, oldest first. The day window is then ignored, and the run columns count the runs since `ID`, not the last 7 days (see [Run history](#run-history)). Without `--history`, or below `0`, it is a usage error. |
@@ -329,6 +339,8 @@ they match. `64` for a usage error, such as a mistyped flag or an invalid `--mat
 
 * a `--lint PATH` or `--diff` whose tasks were all under `\Microsoft\` and skipped, so nothing
   was examined; pass `--all`
+* a `--match` that matches no task, in the health report, `--history`, `--lint` and `--diff`
+  (with `--diff`, no task on either side), so nothing was examined
 * an unreadable export (with `--diff`, either of the two), a subfolder of a linted folder that
   cannot be listed or is a symbolic link, or a failed inventory read; no report prints then
 * an `--out` it could not write
@@ -429,7 +441,7 @@ that only looks like a path, such as a password with a `/` in it, can be a secre
 
 The split between Error and Warning matters on a desktop. Vendor updaters routinely run
 interactive on a daily trigger, and flagging each of them as an Error would bury the one
-nightly Python job that matters. On the development machine, `--lint --all` gave 15
+nightly Python job that matters. On the development machine, `--lint --all` gave several
 `interactive-only` findings. Every one ran a plain program, not a script, so each was a Warning
 and the lint exited `0`. One more task there has an interactive logon and a disabled one-time
 trigger beside its logon trigger. The lint does not report it, because that trigger never
@@ -573,10 +585,10 @@ $ echo $?
 2
 ```
 
-That watermark is the point of the second flag. The Operational log is busy. On one server it
-carried roughly a thousand events a day, and only about a quarter of them belonged to the
-monitored tasks. That figure was observed once, on one server, and was not reproduced here.
-At that rate a 5000-event read reaches back about five days, not the thirty you asked for.
+That watermark is the point of the second flag. The Operational log is busy. On one server most
+of its events belonged to tasks other than the monitored ones. That was observed once, on one
+server, and was not reproduced here. On such a log a 5000-event read can reach back only a few
+days, not the thirty you asked for.
 Pass the printed id back as `--since-record-id`, and the next read takes only the records
 newer than it, oldest first. A read that the cap did not stop prints the log's newest record
 id, even when it found no event, because it has seen every record up to that one. Only a log
@@ -664,7 +676,9 @@ the last good run. Windows lists them in the log's provider manifest. This table
 | `332` | Launch condition not met, user not logged-on | task, user | A refused launch of kind `no-session`. |
 
 A run that `111`, `329` or `330` ended gets no end time and no duration, so it never reaches
-the duration baseline. A refused launch is not a run, so `runs_last_7_days` does not count it.
+the duration baseline. That rule assumes Windows logs no `102` after the termination. If it
+does, the run gets that `102`'s time as its end and a duration, and the duration can feed the
+baseline. A refused launch is not a run, so `runs_last_7_days` does not count it.
 The history script needed no change to read these events. The task name, the instance id (as
 `InstanceId` or `TaskInstanceId`) and the result code have the same names in every one of them.
 
@@ -745,16 +759,24 @@ is never `No differences.` over zero tasks.
 
 The arguments of an action can hold a secret, and a diff prints both sides. So it prints them
 through `mask_arguments`, which replaces with `***`: the value of a switch whose name holds
-`key`, `token`, `secret`, `pass`, `pw`, `credential`, `auth` (but not `author`) or `bearer`; the
-value of a one-letter `-P` or `-p`, which is the password of `sqlcmd` and `mysql`; the word
-after such a switch that has no value of its own; a value with `=` or `+` in it and no file extension, which is how base64 keys
-and connection strings look; the password in the `user:password@host` of a URL; and every
-argument of `net`, which takes its password by position. A `cmd /c` body is masked word by
-word. When a secret changes and the mask makes both sides read the same, the row says
-`(a value changed that is not printed)`, so the change is not lost. The self-test greps the
-table, the `csv` and the `json` of seven such changes for the secrets, and finds none. The
-program field is masked the same way when it holds a command line, as in
-`sync.exe --password x`.
+`key`, `token`, `secret`, `pass`, `pw`, `pswd`, `cred`, `auth` (but not `author`), `bearer`,
+`signature` or `encodedcommand`, or is `sas`, `sig`, `pat` or `rp`; the value of a one-letter
+`-P` or `-p`, which is the password of `sqlcmd` and `mysql`, and the rest of an attached
+`-pSECRET` or `-PSECRET` (but not a PowerShell parameter such as `-Path` or `-Port`); the word
+after such a switch that has no value of its own; a value, quoted or not, that has spaces in it
+and follows such a switch; a value with `=` or `+` in it and no file extension, which is how
+base64 keys and connection strings look; the password in the `user:password@host` of a URL; the
+`user:password` after `-u`, `-U`, `--user`, `--login` or `--proxy-user`; the value of a header
+whose name holds `key`, `token`, `secret`, `pass`, `auth`, `cookie`, `bearer`, `signature` or
+`session`, as in `-H "X-Api-Key: ..."` or `-H "Authorization: Bearer ..."`; and every argument
+of `net`, which takes its password by position. That holds for a `net` command inside a `cmd /c`
+or `-Command` body too, up to the next `&`, `|` or `;`. A `cmd /c` body is masked word by word.
+When a secret changes and the mask makes both sides read the same, the row says `(a value
+changed that is not printed)`, so the change is not lost. The self-test greps the table, the
+`csv` and the `json` of seven such changes for the secrets, and finds none. It masks 27 more
+command-line shapes, from `-Password "a b"` to `curl -u user:pass`, and checks each one. The
+program field is masked the same way when it holds a command line, as in `sync.exe --password
+x`.
 
 ### The licence note
 
@@ -777,7 +799,7 @@ time set by the account administrator". None of this is in the task definition, 
 cannot read it. The note says which task to check, and for which account. It is not a probe
 of the licence (see Limitations).
 
-On the development machine, the 13 tasks outside `\Microsoft\` were exported twice, with
+On the development machine, the tasks outside `\Microsoft\` were exported twice, with
 `Export-ScheduledTask` (one UTF-16 file per task, in a folder) and with `schtasks /query /xml ONE`
 (one file for every task). `taskpulse.py --diff` of the folder against the file gave
 `No differences.` and exit `0`. It also printed on stderr that the file's tasks under
@@ -819,11 +841,10 @@ stock box.
 
 **Re-reading the same events.** The obvious incremental filter is a time window: fetch the last
 thirty days each run. It does not hold, because the fetch is also capped by an event count. That
-log carried roughly a thousand events a day on one server, only about a quarter of them from the
-monitored tasks, so a 5000-event window reached back about five days rather than thirty and the
-rest of the month was silently absent. `--history` filters on `EventRecordID` above a watermark
-instead, which is monotonic and costs nothing to store, and keeps the time window only for the
-cold start when no watermark exists yet.
+log held mostly events of other tasks on one server, so a 5000-event window reached back only a
+few days rather than thirty and the rest of the month was silently absent. `--history` filters
+on `EventRecordID` above a watermark instead, which is monotonic and costs nothing to store, and
+keeps the time window only for the cold start when no watermark exists yet.
 
 **Silencing the history read.** The obvious way to survive a disabled log is
 `Get-WinEvent ... -ErrorAction SilentlyContinue`. That also hides access denied, a missing log
@@ -924,8 +945,10 @@ apart gets ignored the first night it reports one.
 * **A start with no end event can make a task STUCK later.** If the host rebooted mid-run, that
   start stays open. Whenever the task is `Running` again, the report names the old run's age,
   such as 240.0 hours, even beside a healthy 12-minute run.
-* **A disabled task whose last run never logged an end event is reported STUCK**, because only
-  `Ready` and `Queued` rule `STUCK` out.
+* **A disabled task whose last run never logged an end event has the fate STUCK**, because only
+  `Ready` and `Queued` rule `STUCK` out. Its status stays `Disabled`, so the default table
+  hides the row in every format. It shows with `--show-ok`, and its `fate` field says `STUCK`
+  in the `json` and `csv` output.
 * **STUCK and BLOCKED never change the exit code.** A check that reads only the exit code stays
   green over a hung job. Read the `fate` field of the `json` or `csv` output if a hung or
   blocked job must fail a check.
@@ -1021,8 +1044,8 @@ apart gets ignored the first night it reports one.
 * **The `--history` join is case sensitive.** If the event log spells a task's path in another
   case than the inventory, for example after a re-registration, those runs join to no task and
   are not counted.
-* **A `--match` that matches no task is a clean run.** It prints `No tasks need attention.` and
-  exits `0`, so a check scoped to a renamed, deleted or unreadable task stays green.
+* **A `--match` that matches a task is judged on that task alone.** A task that matches but has
+  no row to print is a clean run. Only a `--match` that matches no task at all exits `1`.
 * **The event filter is near the XPath limit.** The limit counts clauses, so it depends on the
   query form. On the Application log of the development machine, the watermark form ran with
   22 event ids and failed with 23 ("The specified query is invalid"). The cold-start form,
@@ -1063,7 +1086,7 @@ apart gets ignored the first night it reports one.
 * **The measured results are point-in-time.** The live-versus-XML comparison of the lint, the
   findings without `--all`, the share of tasks with no time limit and the diff of the two
   exports were measured once on one machine. Its task set changes, so a rerun can give other
-  numbers. This README leaves the machine's counts out on purpose.
+  numbers. This README gives those counts as words, not numbers.
 * **Linux coverage used a virtualenv.** Branch coverage is 100 percent on Windows and on
   Linux. Coverage is not installed for the Linux host's system `python3`, so the Linux
   measurement ran in a virtualenv of that same Python 3.12.3.
@@ -1217,13 +1240,42 @@ apart gets ignored the first night it reports one.
   export writes out and the other leaves out reads as a change, because Microsoft documents
   no default for it. The same holds for any `Settings` element that has no default in the
   schema.
-* **The argument mask is a set of patterns.** It masks a secret switch by its name, and `-P`
-  and `-p` by their letter. These secrets still print in full: `--pswd X`, `--sas X`,
-  `--sig X`, `--pat X`, `--login user:X`, `/RP X`, `-RP X`, `-EncodedCommand X`, a JSON body
-  such as `--data {"password":"X"}`, the attached form `-pX`, and the `Basic` or `Bearer`
-  token of an `Authorization:` header. The csv and json diff output and any `--out` file are
-  redacted no further than the table. The self-test pins what the mask hides, not what it
-  cannot see. Review a diff before it leaves the machine, as with the rest of the output.
+* **The argument mask is a set of patterns.** It masks a secret by its switch name, by the
+  letter of a one-letter `-P` or `-p`, by `-u` or `--user` with a `:` in the value, and by the
+  name of a header. These secrets still print in full: `-k X`, the attached `-uuser:X`, `-uX`,
+  `-U user%X`, a JSON body such as `--data {"password":"X"}`, a header with another name such
+  as `-H "X-Custom: X"`, and a secret switch whose value starts with `-` or `/`, such as
+  `--password -X`, which is read as the next switch. The csv and json diff output and any
+  `--out` file are redacted no further than the table. The self-test pins what the mask hides,
+  and that these forms print, not what else it cannot see. Review a diff before it leaves the
+  machine, as with the rest of the output.
+* **`--diff` masks command lines only.** It prints the `Start In` folder, each trigger's fields
+  and an event trigger's `Subscription` text as they are, so a secret placed there prints.
+* **A quoted share with a space is named by its first part.** `/SRC:"\\srv\my share\data"` is one
+  value, so it raises no false `start-in-missing` Error, but the share finding names
+  `\\srv\my`, because the share pattern stops at a space.
+* **The tokenizer follows Windows' quote rule, not its backslash rule.** A `"` opens or closes a
+  quote anywhere in a word, and a `'` only at the start of a word or after `=` or `:`. A
+  backslash escapes nothing, so a `\"` that Windows reads as a literal quote reads as a quote
+  here.
+* **The exit code ignores STUCK, BLOCKED and a week of failures.** A task that is STUCK or
+  BLOCKED, or that failed in the last 7 days and succeeded on its last run, is a Warning, so a
+  check that fails on them must read the `fate` or `failures_last_7_days` field of the `json`
+  output.
+* **A failed `--history` read still prints `No tasks need attention.`.** It goes to stdout, and
+  to an `--out` file with `--apply`. Only the exit code `1` and stderr say the history was not
+  read, so check the exit code, not the file.
+* **`--apply` with `--out` overwrites the target without asking.** `--out` is refused only
+  when it is a file or folder the same run lints or compares, so any other file taskpulse can
+  write, such as a different export or the script itself, is replaced.
+* **`--lint` skips disabled tasks.** A folder of only disabled tasks prints `No findings.` and
+  exits `0`.
+* **Keep one file per task in an export folder.** `--diff` and `--lint` key a task by its path,
+  so two files that define the same task collide, the later one wins, and a difference in the
+  dropped file prints `No differences.` with exit `0`.
+* **No check reads `DisallowStartIfOnBatteries` or `StopIfGoingOnBatteries`.** Both default to
+  true, and on battery power they skip or stop runs without an error, as on a laptop or a
+  host behind a UPS. The lint lists them among the defaults and never judges them.
 * **`trigger-expired` does not know the time zone.** A time with no offset is the machine's
   local time, and an export does not say which. A trigger counts as ended a day after its end,
   so a zone cannot change the answer, and a trigger that ended an hour ago is not reported yet.

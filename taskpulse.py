@@ -50,7 +50,6 @@ import json
 import ntpath
 import os
 import re
-import shlex
 import shutil
 import subprocess
 import sys
@@ -187,12 +186,28 @@ BODY_SWITCH = {"cmd": r"/[ck]", "powershell": PS_BODY, "pwsh": PS_BODY}
 # printed; only the share check reads it (see arg_values). "pass" covers --pass, password,
 # passwd and passphrase; "pw" covers plink's -pw and pwd. A one-letter -P or -p is left out:
 # it is a port or a path as often as a password. Only --diff's mask adds them (MASKED_LETTERS).
-SECRET_SWITCH = re.compile(r"key|token|secret|pass|pw|credential|auth(?!or)|bearer",
-                          re.IGNORECASE)
+SECRET_SWITCH = re.compile(
+    r"key|token|secret|pass|pw|pswd|cred|auth(?!or(?!iz))|bearer|signature|encodedcommand|"
+    r"^(?:sas|sig|pat|rp)$",
+    re.IGNORECASE)
 # --diff prints command lines, so it also masks the value of a one-letter -P or -p, which is
 # sqlcmd's and mysql's password. A port after -p is masked too: a changed port is reported as a
 # change whose value is not printed, which costs nothing, where a printed password costs a lot.
 MASKED_LETTERS = frozenset(["p", "P"])
+# --diff also masks the credential that curl-style programs take after -u or --user as
+# user:password. A value with no ':' is an account name or a python -u script, and prints.
+CRED_SWITCH = frozenset(["u", "U", "user", "login", "proxy-user"])
+CRED_VALUE = re.compile(r"[^\s:/]{2,}:")
+# The attached form -pSECRET (7z, mysql) and -PSECRET (sqlcmd) is masked, except for these
+# PowerShell parameters, which start the same way and take a path, a port or a name.
+ATTACHED_PARAMS = frozenset(
+    ["path", "pattern", "port", "property", "protocol", "process", "processname", "proxy",
+     "parameter", "principal", "priority", "prefix"])
+# A header such as `X-Api-Key: value` or `Authorization: Bearer value`: the name says it holds
+# a secret, so everything after the colon is masked.
+SECRET_HEADER = re.compile(
+    r"^([\w-]*(?:key|token|secret|pass|auth(?!or(?!iz))|cookie|bearer|signature|session)[\w-]*:)"
+    r"\s*\S.*$", re.IGNORECASE | re.DOTALL)
 # Switch names whose value is an account, such as net use's /user:EXAMPLE\svc. An account is
 # not a path, although DOMAIN\name has a separator. A one-letter -u is left out: to python it
 # is a switch with no value, so the script after it would be lost.
@@ -589,19 +604,28 @@ def program_name(executable):
 
 
 def split_args(value):
-    text = text_of(value)
-    if not text:
-        return []
-    # Windows' argv parser runs an unclosed quote to the end of the line and the task still
-    # runs, so close it the same way. One whole-line token would skip the secret-switch rule
-    # and print a password in a finding. shlex(posix=False) also opens a quote at '.
-    try:
-        words = shlex.split(text, posix=False)
-    except ValueError:
-        try:
-            words = shlex.split(text + '"', posix=False)
-        except ValueError:
-            words = shlex.split(text + "'", posix=False)
+    r"""The words of a command line, each keeping its quotes, as Windows' argv parser cuts them.
+
+    A " opens or closes a quote anywhere in a word, so `--out="C:\my out\r.csv"` and
+    `/LOG:"C:\my logs\x.txt"` are one word each. A ' opens a quote only at the start of a word
+    or after = or :, because PowerShell quotes a path with ' but a name such as O'Brien is not
+    quoted. An unclosed quote runs to the end of the line and the task still runs, so it is
+    closed there. One whole-line word would skip the secret-switch rule and print a password in
+    a finding. Backslashes escape nothing: a path ends in one.
+    """
+    words, word, quote = [], "", ""
+    for char in text_of(value):
+        if quote:
+            word += char
+            quote = "" if char == quote else quote
+        elif char == '"' or (char == "'" and (not word or word[-1] in "=:")):
+            word, quote = word + char, char
+        elif char.isspace():
+            words.append(word)
+            word = ""
+        else:
+            word += char
+    words.append(word + quote)
     return [part.strip() for part in words if part.strip()]
 
 
@@ -915,10 +939,9 @@ def build_run_rows(events, tasks):
     task could not start at all) has no instance, so it is a row of its own, named after its
     record. Events 153, 322 and 332 are refused launches, not runs; build_block_rows() takes
     them. A run whose 100 event
-    fell outside the fetch window used to emit a run with no start time at all - dozens of such
-    rows in the table this was ported from - so the earliest observed event time is used instead
-    and the row carries start_time_estimated, which stops an estimate reading as a
-    measurement. Such a run gets no duration, so it never reaches the baseline. A group with
+    fell outside the fetch window used to emit a run with no start time at all, so the earliest
+    observed event time is used instead and the row carries start_time_estimated, which stops
+    an estimate reading as a measurement. Such a run gets no duration, so it never reaches the baseline. A group with
     nothing datable at all is dropped, not emitted with no start.
 
     An event naming a task that is not in `tasks` is skipped, so a filtered inventory yields a
@@ -1023,9 +1046,9 @@ def summarize_runs(run_rows, now, since_record_id=None):
     A failure is then counted by the one run that read it, and a backlog older than 7 days is
     not dropped while the watermark moves past it.
 
-    `now` is injected and never read from the clock. The version this was ported from took no
-    clock and called the wall clock inside the cutoff, so every test written against a pinned
-    clock passed on the day it was written and failed a week later.
+    `now` is injected and never read from the clock. A cutoff that reads the wall clock
+    itself makes every test written against a pinned clock pass on the day it was written and
+    fail a week later.
     """
     cutoff, window = history_window(now, since_record_id)
     summary = {}
@@ -1188,7 +1211,10 @@ def arg_values(arguments, body=None, hidden=None):
         value = unquote(token)
         if body and re.match(body + "$", value, re.IGNORECASE):
             rest = tokens[index + 1:]
-            words = body_words(unquote(rest[0]) if len(rest) == 1 else " ".join(rest))
+            line = unquote(rest[0]) if len(rest) == 1 else " ".join(rest)
+            if body == BODY_SWITCH["cmd"] and line[:1] == line[-1:] == '"' and line.count('"') > 2:
+                line = line[1:-1]  # cmd /c strips the outer pair when the line holds more quotes
+            words = body_words(line)
             inner = BODY_SWITCH.get(program_name(words[0])) if words else None
             return values + arg_values(" ".join(words), inner, hidden)
         secret, secret_next = secret_next, False
@@ -1673,35 +1699,76 @@ def read_task_files(paths, walk=os.walk, islink=os.path.islink):
 # task definition diff (--diff) - pure: two lists of parsed tasks in, rows out
 # --------------------------------------------------------------------------
 
+def mask_word(value, state):
+    """(shown text, state for the next word) of one word of a command line, for mask_arguments.
+
+    `state` is "secret" when the word before was a secret switch with no value of its own, and
+    "cred" when it was -u or --user, whose value is a secret only when it holds a ':'.
+    """
+    if not re.search(r"\s", value):
+        value = URL_AUTH.sub(r"\1***@", value)
+    head, secret, after = "", state == "secret", ""
+    if value[:1] in ("-", "/") and value[:2] != "//" and (
+            not re.search(r"\s", value) or re.match(r"[-/]+[^=:\s]*[=:]", value)):
+        dashes, name, sep, value = re.match(r"([-/]*)([^=:\s]*)([=:]?)(.*)", value,
+                                            re.DOTALL).groups()
+        head = dashes + name + sep
+        attached = (dashes == "-" and name[:1] in MASKED_LETTERS and len(name) > 1
+                    and name.lower() not in ATTACHED_PARAMS
+                    and not SECRET_SWITCH.match(name))
+        if attached:
+            return dashes + name[:1] + "***" + sep + ("***" if value else ""), ""
+        secret = bool(SECRET_SWITCH.search(name)) or name in MASKED_LETTERS
+        if secret and not value:
+            after = "secret"
+        if name in CRED_SWITCH:
+            secret = bool(CRED_VALUE.match(unquote(value)))
+            after = "" if value else "cred"
+    elif state == "cred":
+        secret = bool(CRED_VALUE.match(unquote(value)))
+    inner = unquote(value) if head else value
+    if re.search(r"\s", inner):
+        header = SECRET_HEADER.match(inner)
+        text = ('"%s ***"' % header.group(1) if header and not secret
+                else '"***"' if secret else '"%s"' % mask_arguments(inner))
+        return head + text, ""
+    header = None if head else SECRET_HEADER.match(value)
+    opaque = re.search(r"[=+]", value) and extension_of(value) not in PATH_EXTS
+    if header:
+        return header.group(1) + "***", after
+    return head + ("***" if value and (secret or opaque) else value), after
+
+
 def mask_arguments(arguments, program=""):
     r"""A command line with every value that could be a secret replaced by ***.
 
     The rules of arg_values(), kept to what a diff prints: the value of a secret switch
     (SECRET_SWITCH), the word after a secret switch that has no value of its own, a value
     with '=' or '+' in it and no known file extension, which base64 keys and connection
-    strings have, and the password in the user:password@host of a URL. Every argument of `net` is masked, because `net use \\srv\share <password>`
-    takes its password by position. A word that holds spaces, such as the body of cmd /c, is
-    masked word by word. A value after a one-letter switch is not masked, except -P and -p
-    (MASKED_LETTERS); the attached form -pSECRET is not (see the README).
+    strings have, the password in the user:password@host of a URL, the user:password after -u
+    or --user (CRED_SWITCH), the value of a header whose name says it holds a secret
+    (SECRET_HEADER) and the attached -pSECRET (ATTACHED_PARAMS). Every argument of `net` is
+    masked, because `net use \srv\share <password>` takes its password by position, and so is
+    every word of a `net` command inside a cmd /c or powershell -Command body, up to the next
+    & | or ;. A word that holds spaces, such as a quoted body, is masked word by word. A value
+    after a one-letter switch is not masked, except -P and -p (MASKED_LETTERS).
     """
     if program == "net":
         return "***" if text_of(arguments) else ""
-    words, secret_next = [], False
+    words, state, net_args = [], "", False
     for token in split_args(arguments):
         value = unquote(token)
-        secret, secret_next = secret_next, False
-        if re.search(r"\s", value):
-            words.append('"%s"' % mask_arguments(value))
-            continue
-        value = URL_AUTH.sub(r"\1***@", value)
-        head = ""
-        if value[:1] in ("-", "/") and value[:2] != "//":
-            dashes, name, sep, value = re.match(r"([-/]*)([^=:]*)([=:]?)(.*)", value).groups()
-            head = dashes + name + sep
-            secret = bool(SECRET_SWITCH.search(name)) or name in MASKED_LETTERS
-            secret_next = secret and not value
-        opaque = re.search(r"[=+]", value) and extension_of(value) not in PATH_EXTS
-        words.append(head + ("***" if value and (secret or opaque) else value))
+        shown = ""
+        for piece in ([value] if re.search(r"\s", value) else re.split(r"([&|;]+)", value)):
+            if re.match(r"[&|;]+$", piece):
+                net_args, shown = False, shown + piece
+            elif net_args and piece:
+                shown += "***"
+            elif piece:
+                text, state = mask_word(piece, state)
+                net_args = program_name(piece) == "net"
+                shown += text
+        words.append(shown)
     return " ".join(words)
 
 
@@ -3374,6 +3441,48 @@ def self_test():
                              arguments=r"-File run.ps1 -Tag dry-c cd C:\x"))
           == [("Error", "start-in-missing")],
           "a '-c' inside another word is not powershell's -c switch")
+    check(split_args(r'--out="C:\my out\r.csv"') == [r'--out="C:\my out\r.csv"']
+          and split_args(r'/LOG:"C:\my logs\x.txt" a') == [r'/LOG:"C:\my logs\x.txt"', "a"]
+          and split_args(r"-Out='C:\my out\r.csv'") == [r"-Out='C:\my out\r.csv'"]
+          and split_args("don't stop") == ["don't", "stop"]
+          and split_args('a "b c') == ["a", '"b c"']
+          and split_args('x "" y') == ["x", '""', "y"]
+          and split_args("") == [],
+          "a quote opens in the middle of a word, an apostrophe inside a name does not, and an "
+          "unclosed quote is closed at the end of the line  <-- pinned defect")
+    for why, command, arguments in (
+            ("a quote attached to --out=", r"C:\Python39\python.exe",
+             r'C:\jobs\etl.py --out="C:\my out\r.csv"'),
+            ("a quote attached to /out:", r"C:\Python39\python.exe",
+             r'C:\jobs\etl.py /out:"C:\my out\r.csv"'),
+            ("a quote attached to /LOG:", "robocopy.exe",
+             r'C:\a "C:\my b" /LOG:"C:\my logs\x.txt"'),
+            ("cmd's doubled quote around a path with a space", "cmd.exe",
+             r'/c ""C:\my jobs\x.bat""'),
+            ("cmd's outer quote around a quoted program and a quoted redirect", "cmd.exe",
+             r'/c ""C:\Program Files\app\run.bat" > "C:\my logs\o.txt" 2>&1"'),
+            ("a single-quoted PowerShell value", "powershell.exe",
+             r"-File C:\jobs\run.ps1 -Out='C:\my out\o.txt'")):
+        check("Error" not in [severity for severity, _ in finding_checks(
+            job(start="", command=command, arguments=arguments))],
+              "%s is one value, not a relative path  <-- pinned defect" % why)
+    check(finding_checks(job(start="", arguments=r'C:\jobs\refresh.py --out="reports\my out.csv"'))
+          == [("Error", "start-in-missing")]
+          and finding_checks(job(start="", command="cmd.exe",
+                                 arguments=r'/c ""C:\jobs\x.bat" > "logs\my out.txt""'))
+          == [("Error", "start-in-missing")],
+          "a relative path inside a quote that holds a space is still judged")
+    check(classify_command("powershell.exe", r"-File C:\jobs\run") == (
+        r"C:\jobs\run", "PowerShellScript")
+          and classify_command("powershell.exe", r"-f C:\jobs\run") == (
+              r"C:\jobs\run", "PowerShellScript")
+          and classify_command("powershell.exe", "-File") == ("powershell.exe", "PowerShell")
+          and classify_command(r"C:\Python39\python.exe", "-m") == (
+              r"C:\Python39\python.exe", "Python")
+          and classify_command(r"C:\Python39\python.exe", "-m etl.run") == (
+              "etl.run", "PythonModule"),
+          "-File and -f name the script even without a .ps1, and a last -File or -m has no "
+          "script to name")
 
     check(finding_checks(job(command="python.exe")) == [("Warning", "bare-program")],
           "a bare python.exe runs whichever python the account's PATH finds first")
@@ -3672,6 +3781,10 @@ def self_test():
           and check_names(ending("2026-07-27T11:00:00Z"), now=now) == [("Warning",
                                                                         "trigger-expired")],
           "a trigger counts as ended a day after its end, because a time with no zone is local")
+    check(check_names(ending("2026-07-27T12:00:00Z"), now=now) == []
+          and check_names(ending("2026-07-27T11:59:59Z"), now=now) == [("Warning",
+                                                                        "trigger-expired")],
+          "a trigger that ended exactly a day ago is not yet expired, one second more is")
     check(check_names(ending("2026-06-01T00:00:00", ""), now=now) == []
           and check_names(ending(""), now=now) == []
           and check_names(dict(job(), trigger_details=[]), now=now) == [],
@@ -3887,13 +4000,78 @@ def self_test():
           == [("changed", "setting ExecutionTimeLimit", "PT72H", "PT0S")],
           "no licence note for another program, or for an ArcGIS task whose account and logon "
           "did not change")
+    check([row[1] for row in changes(parsed(command=arcgis),
+                                     parsed(command="cmd.exe", user="EXAMPLE\\other"))]
+          == ["run as", "action 1", "arcpy-licence"]
+          and [row[1] for row in changes(parsed(command="cmd.exe"),
+                                         parsed(command=arcgis, user="EXAMPLE\\other"))]
+          == ["run as", "action 1", "arcpy-licence"],
+          "the licence note holds when ArcGIS Python is on only the old side or only the new")
 
+    leaks = (
+        ('-Password "correct horse battery"', ""),
+        ("--passphrase 'correct horse battery'", ""),
+        ('--password="correct horse battery"', ""),
+        ('--api-key="abc def"', ""),
+        (r"/c net use Z: \\srv\share Hunter2 /user:EX\svc && robocopy a b", "cmd"),
+        (r'/c "net use Z: \\srv\share Hunter2 /user:EX\svc & robocopy a b"', "cmd"),
+        ("-u svc:Hunter2 https://h/a", "curl"),
+        ("--user svc:Hunter2 https://h/a", "curl"),
+        ("--user=svc:Hunter2 https://h/a", "curl"),
+        ('-H "X-Api-Key: Hunter2" https://h/a', "curl"),
+        ('-H "Authorization: Bearer Hunter2" https://h/a', "curl"),
+        ("-H X-Api-Key:Hunter2 https://h/a", "curl"),
+        ("--authorization Hunter2", ""),
+        ("a -pHunter2 out.7z", "7z"),
+        ("-PHunter2 -S srv", "sqlcmd"),
+        ("--pswd Hunter2", ""),
+        ("--cred Hunter2", ""),
+        ('-H "Cookie: sid=Hunter2"', "curl"),
+        ("--proxy-user svc:Hunter2", "curl"),
+        ("-U svc:Hunter2", "smbclient"),
+        ("--sas Hunter2", ""),
+        ("--sig Hunter2", ""),
+        ("--pat Hunter2", ""),
+        ("/RP Hunter2", ""),
+        ("--login svc:Hunter2", ""),
+        ("--signature Hunter2", ""),
+        ("-EncodedCommand Hunter2", "powershell"))
+    check(all("Hunter2" not in mask_arguments(line, program) and "***" in mask_arguments(
+        line, program) for line, program in leaks),
+          "a quoted or attached secret, a net command inside a cmd /c body, curl's -u and "
+          "-H, -pSECRET, --pswd, --cred, --signature and -EncodedCommand are all masked  "
+          "<-- pinned defect")
+    check(all("Hunter2" in mask_arguments(line) for line in (
+        "-k Hunter2", "-usvc:Hunter2", "-U svc%Hunter2", '--data {"password":"Hunter2"}',
+        "--password -Hunter2", '-H "X-Custom: Hunter2"', "-uHunter2")),
+          "the documented gaps: these forms still print in full, so the README lists them")
+    check(mask_arguments(r"/c net use Z: \\srv\share Hunter2 && robocopy a b", "cmd")
+          == "/c net *** *** *** *** && robocopy a b"
+          and mask_arguments('-Password "correct horse battery" -Name x', "")
+          == '-Password "***" -Name x'
+          and mask_arguments("--user svc --out r.csv -u C:\\jobs\\a.py", "")
+          == "--user svc --out r.csv -u C:\\jobs\\a.py"
+          and mask_arguments(r"-Path C:\x -Port 80 --author Ann", "")
+          == r"-Path C:\x -Port 80 --author Ann"
+          and mask_arguments('--out="C:\\my out\\r.csv"', "") == '--out="C:\\my out\\r.csv"',
+          "the masks leave the rest of the line as it was: a net command ends at the next "
+          "&, a user with no password, a path, a port and --author print")
+    check("Hunter2" not in shown_program(r'C:\tools\sync.exe -Password "a b" --token Hunter2')
+          and "Hunter2" not in " ".join(
+              f["detail"] for f in lint_task(job(command=r'sync.exe -Password "a b" --token Hunter2',
+                                                 arguments=""))),
+          "a command line in the Command field is masked in the health report's target and "
+          "in the bare-program finding  <-- pinned defect")
+    diffed = changes(parsed(command="cmd.exe", arguments=r"/c net use Z: \\srv\s Hunter2OLD"),
+                     parsed(command="cmd.exe", arguments=r"/c net use Z: \\srv\s Hunter2NEW"))
+    check(len(diffed) == 1 and "Hunter2" not in repr(diffed),
+          "--diff of a net use inside cmd /c prints neither password  <-- pinned defect")
     secret_line = ("-password Hunter2 --token=abc123 /pw:Secret9 -apikey QUJD+RA== data.csv "
                    "-x 5")
     check(mask_arguments(secret_line) == "-password *** --token=*** /pw:*** -apikey *** "
           "data.csv -x 5", "the value of every secret switch is masked, and nothing else")
     check(mask_arguments(r'/c "set PGPASSWORD=Hunter2&& C:\jobs\run.bat"')
-          == r'/c "set *** C:\jobs\run.bat"'
+          == r'/c "set ***&& C:\jobs\run.bat"'
           and mask_arguments("--out=r.csv -Name=foo+bar //host/share /var/log")
           == "--out=r.csv -Name=*** //host/share /var/log"
           and mask_arguments(r'"C:\Program Files\x\y.exe"') == r'"C:\Program Files\x\y.exe"'
@@ -4093,6 +4271,16 @@ def self_test():
             code, out, err = cli("--match", "etl$", "--show-ok")
             check(code == 0 and r"\Jobs\broken" not in out,
                   "--match scopes the report and the exit code with it")
+            code, out, err = cli("--match", "nothing")
+            check(code == 1 and out == "" and "matched no task" in err,
+                  "the health report --match that matches no task is not 'No tasks need "
+                  "attention'  <-- pinned defect")
+            code, out, err = cli("--history", "--match", "nothing")
+            check(code == 1 and out == "" and "matched no task" in err and "read " not in err,
+                  "--history --match that matches no task stops before the log is read")
+            check(cli("--history", "7")[0] != 64 and cli("--history", "--stuck-hours", "1")[0] != 64
+                  and cli("--history", "--stuck-hours", "0")[0] == 64,
+                  "--history 7 and --stuck-hours 1 are the smallest accepted values")
             code, out, err = cli("--history", "--since-record-id", "50")
             check("read 3 run event(s)" in err and "--since-record-id 90" in err,
                   "--history reports the watermark over every event read, joined or not")
@@ -4419,14 +4607,48 @@ def self_test():
             check(code == 2 and {row["field"] for row in json.loads(out)}
                   == {"setting ExecutionTimeLimit", "logon type"},
                   "--diff writes json, and --match scopes it")
+            code, out, err = cli("--diff", old_export, old_export, "--match", "nightly")
+            check(code == 0 and out == "No differences.\n" and err == "",
+                  "--match that keeps a task with no difference is a clean diff")
             code, out, err = cli("--diff", old_export, new_export, "--match", "nothing")
-            check(code == 0 and out == "No differences.\n",
-                  "--match that keeps no row is a clean diff")
+            check(code == 1 and out == "" and "matched no task" in err,
+                  "--diff --match that matches no task is not a clean diff  <-- pinned defect")
+            code, out, err = cli("--lint", loose, "--match", "nothing")
+            check(code == 1 and out == "" and "matched no task" in err,
+                  "--lint --match that matches no task is not 'No findings'  <-- pinned defect")
             code, out, err = cli("--diff", os.path.join(scratch, "Tasks"), loose)
             check(code == 2 and "removed" in out and "added" in out and r"\export" in out
                   and r"\Jobs\nightly" in out,
                   "--diff reads a folder as it reads a file, and a task in one side is added or "
                   "removed")
+            dup_folder = os.path.join(scratch, "dups")
+            os.makedirs(dup_folder)
+            for name, limit in (("a.xml", "PT0S"), ("b.xml", "PT1H")):
+                with open(os.path.join(dup_folder, name), "wb") as handle:
+                    handle.write(task_xml(uri="\\Jobs\\dup", limit=limit).encode("utf-8"))
+            dup_one = os.path.join(scratch, "dup-one.xml")
+            with open(dup_one, "wb") as handle:
+                handle.write(task_xml(uri="\\Jobs\\dup", limit="PT1H").encode("utf-8"))
+            code, out, err = cli("--diff", dup_one, dup_folder)
+            check(code == 0 and out == "No differences.\n",
+                  "two files that define one task: the later one wins, and a difference in the "
+                  "dropped file is not reported (a README limit)")
+            off = os.path.join(scratch, "off.xml")
+            with open(off, "wb") as handle:
+                handle.write(task_xml(uri="\\Jobs\\off", enabled="false", start="",
+                                      arguments="refresh.py").encode("utf-8"))
+            code, out, err = cli("--lint", off)
+            check(code == 0 and out == "No findings.\n",
+                  "a disabled task is not linted, so an export of only disabled tasks is clean "
+                  "(a README limit)")
+            other = os.path.join(scratch, "other-file.txt")
+            with open(other, "w") as handle:
+                handle.write("keep me")
+            code, out, err = cli("--lint", off, "--show-ok", "--out", other, "--apply")
+            with open(other) as handle:
+                replaced = handle.read()
+            check(code == 0 and replaced == "No findings.\n",
+                  "--apply replaces any other file it can write without asking (a README limit)")
             stock_old = os.path.join(scratch, "stock-old.xml")
             stock_new = os.path.join(scratch, "stock-new.xml")
             for stock_path, stock_limit in ((stock_old, "PT1H"), (stock_new, "PT0S")):
@@ -4709,6 +4931,20 @@ def skip_notice(skipped, sides):
     return False
 
 
+def match_notice(args, pattern, tasks):
+    r"""Say on stderr that --match found no task. True when it found none.
+
+    A scoped check such as --match "^\\Jobs\\nightly" would stay green for ever after the task
+    is renamed or deleted, or after a typo in the regex. Like an empty \Microsoft\ filter
+    (skip_notice), a result over zero tasks is never a clean one. Only a --match that was given
+    counts; an empty inventory with no --match keeps its old answer.
+    """
+    if args.match and not any(pattern.search(full_task_name(task)) for task in tasks):
+        sys.stderr.write("taskpulse: --match matched no task, so there is no result\n")
+        return True
+    return False
+
+
 def main(argv=None):
     parser = Parser(
         prog="taskpulse",
@@ -4807,6 +5043,8 @@ def main(argv=None):
                  for side in (before, after)]
         if skip_notice(len(before) + len(after) - len(sides[0]) - len(sides[1]), sides):
             return 1
+        if match_notice(args, pattern, sides[0] + sides[1]):
+            return 1
         rows = diff_tasks(*sides)
         rows = [row for row in rows if pattern.search(row["task"])]
         return emit(rows, args, diff=True) or (2 if rows else 0)
@@ -4817,6 +5055,8 @@ def main(argv=None):
         if args.lint and skip_notice(len(tasks) - len(kept), [kept]):
             return 1
         tasks = kept
+    if not diff and match_notice(args, pattern, tasks):
+        return 1
 
     run_summary, fates = {}, {}
     incomplete = False
