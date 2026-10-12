@@ -190,10 +190,17 @@ SECRET_SWITCH = re.compile(
     r"key|token|secret|pass|pw|pswd|cred|auth(?!or(?!iz))|bearer|signature|encodedcommand|"
     r"^(?:sas|sig|pat|rp)$",
     re.IGNORECASE)
-# --diff prints command lines, so it also masks the value of a one-letter -P or -p, which is
-# sqlcmd's and mysql's password. A port after -p is masked too: a changed port is reported as a
-# change whose value is not printed, which costs nothing, where a printed password costs a lot.
-MASKED_LETTERS = frozenset(["p", "P"])
+# --diff prints command lines, so it also masks the value of a one-letter -P, -p or -k, which are
+# sqlcmd's and mysql's password and a common name for a key. A port after -p is masked too: a
+# changed port is reported as a change whose value is not printed, which costs nothing, where a
+# printed password costs a lot. curl's -k takes no value, so the word after it is masked for
+# nothing, which costs the same nothing.
+MASKED_LETTERS = frozenset(["p", "P", "k"])
+# The value of a JSON member whose name says it holds a secret, such as {"password":"x"}. The
+# quotes may be backslash-escaped. The name part is bounded so a long word cannot make it slow.
+JSON_SECRET = re.compile(
+    r'(\\?"[^"\s:]{0,64}(?:key|token|secret|pass|pw|cred|auth(?!or(?!iz))|bearer|signature)'
+    r'[^"\s:]{0,64}\\?"\s*:\s*)(?:\\?"[^"]*?\\?"|[^\s,}\]]+)', re.IGNORECASE)
 # --diff also masks the credential that curl-style programs take after -u or --user as
 # user:password. A value with no ':' is an account name or a python -u script, and prints.
 CRED_SWITCH = frozenset(["u", "U", "user", "login", "proxy-user"])
@@ -1112,7 +1119,8 @@ def judge_fates(run_rows, block_rows, tasks, now, since_record_id=None, stuck_ho
 
     STUCK: a run has no end event, and the task's own state does not say otherwise, and either
     the run began `stuck_hours` or more ago, or a later launch was refused because it was still
-    running (event 322). A task whose state is Ready or Queued is not running, so a run with no
+    running (event 322). A task whose state is Running and whose last launch was `stuck_hours`
+    or more ago is STUCK too, even when this read holds no start event for that run. A task whose state is Ready or Queued is not running, so a run with no
     end event is a lost end event, not a stuck run. A state that is missing, as in an XML
     export, does not rule a run out.
 
@@ -1124,13 +1132,15 @@ def judge_fates(run_rows, block_rows, tasks, now, since_record_id=None, stuck_ho
     """
     cutoff, _ = history_window(now, since_record_id)
     states = dict((full_task_name(task), text_of(task.get("state")).lower()) for task in tasks)
+    launched = dict((full_task_name(task), parse_dt(task.get("last_run_time"))) for task in tasks)
     runs, blocks = {}, {}
     for row in run_rows:
         runs.setdefault(row["task"], []).append(row)
     for row in block_rows:
         blocks.setdefault(row["task"], []).append(row)
     verdicts = {}
-    for name in sorted(set(runs) | set(blocks)):
+    running = set(name for name, state in states.items() if state == "running")
+    for name in sorted(set(runs) | set(blocks) | running):
         refused = blocks.get(name, [])
         counted = [row for row in refused
                    if cutoff is None or parse_dt(row["time"]) >= cutoff]
@@ -1145,6 +1155,13 @@ def judge_fates(run_rows, block_rows, tasks, now, since_record_id=None, stuck_ho
                 hours = (now - started).total_seconds() / 3600.0
                 if waiting or hours >= stuck_hours:
                     stuck.append((hours, waiting))
+            # The scheduler's own word: Running since a launch long ago, whether or not this
+            # read holds that run's start event (the log may be shorter than --history).
+            since_launch = launched.get(name)
+            if not stuck and states.get(name) == "running" and since_launch is not None:
+                hours = (now - since_launch).total_seconds() / 3600.0
+                if hours >= stuck_hours:
+                    stuck.append((hours, 0))
         starts = [parse_dt(run["start_time"]) for run in runs.get(name, [])]
         last_start = max([when for when in starts if when] or [None])
         late = [row for row in counted if last_start is None or parse_dt(row["time"]) > last_start]
@@ -1727,6 +1744,14 @@ def mask_word(value, state):
     elif state == "cred":
         secret = bool(CRED_VALUE.match(unquote(value)))
     inner = unquote(value) if head else value
+    if re.search(r"\s", inner) and not head and split_args(inner) == [inner]:
+        # NAME="a b" or x"y z" is one word: mask_arguments(inner) would split it into itself
+        # and recurse for ever. Keep the name, then mask the value as its own line.
+        name, equals, rest = inner.partition("=")
+        if not equals or '"' in name or "'" in name:
+            return '"***"', ""
+        return name + "=" + ("***" if secret or SECRET_SWITCH.search(name) else
+                             '"%s"' % mask_arguments(unquote(rest))), ""
     if re.search(r"\s", inner):
         header = SECRET_HEADER.match(inner)
         text = ('"%s ***"' % header.group(1) if header and not secret
@@ -1751,10 +1776,12 @@ def mask_arguments(arguments, program=""):
     masked, because `net use \srv\share <password>` takes its password by position, and so is
     every word of a `net` command inside a cmd /c or powershell -Command body, up to the next
     & | or ;. A word that holds spaces, such as a quoted body, is masked word by word. A value
-    after a one-letter switch is not masked, except -P and -p (MASKED_LETTERS).
+    after a one-letter switch is not masked, except -P, -p and -k (MASKED_LETTERS). The value
+    of a JSON member named like a secret is masked (JSON_SECRET).
     """
     if program == "net":
         return "***" if text_of(arguments) else ""
+    arguments = JSON_SECRET.sub(lambda m: m.group(1) + '"***"', text_of(arguments))
     words, state, net_args = [], "", False
     for token in split_args(arguments):
         value = unquote(token)
@@ -2981,6 +3008,21 @@ def self_test():
     check(go(59, blocks=[refusal("no-session", 1)])["fate"] == "STUCK",
           "STUCK wins over BLOCKED")
 
+    def running_since(hours, state="Running", launch=True):
+        """judge_fates for a task with no run row at all, last launched `hours` ago."""
+        when = (stuck_now - timedelta(hours=hours)).isoformat() if launch else ""
+        return judge_fates([], [], [dict(inventory[0], state=state, last_run_time=when)],
+                           stuck_now).get(r"\Jobs\etl", {})
+
+    check(running_since(290)["fate"] == "STUCK"
+          and "290.0 hour(s) ago has not finished" in running_since(290)["detail"]
+          and running_since(23.9)["fate"] == "" and running_since(24)["fate"] == "STUCK"
+          and running_since(290, state="Ready") == {} and running_since(290, state="Queued") == {}
+          and running_since(290, launch=False)["fate"] == "",
+          "a task the scheduler says is Running since a launch 24 hours or more ago is STUCK "
+          "although this read holds no start event for the run; Ready, Queued and a missing "
+          "launch time are not  <-- pinned defect")
+
     def finished(started, blocks, **options):
         """judge_fates for a task whose only run began `started` hours ago and ended."""
         return go(started, state="Ready", blocks=blocks, status="Success", **options)
@@ -4035,15 +4077,26 @@ def self_test():
         ("/RP Hunter2", ""),
         ("--login svc:Hunter2", ""),
         ("--signature Hunter2", ""),
-        ("-EncodedCommand Hunter2", "powershell"))
+        ("-EncodedCommand Hunter2", "powershell"),
+        ("-k Hunter2", ""),
+        ('--data {"password":"Hunter2"}', "curl"),
+        ('--data {"user": "svc", "client_secret": "Hunter2", "n": 1}', ""),
+        ("--data {\\\"api_key\\\":\\\"Hunter2\\\"}", ""),
+        ("--data {\"token\":Hunter2}", ""))
     check(all("Hunter2" not in mask_arguments(line, program) and "***" in mask_arguments(
         line, program) for line, program in leaks),
           "a quoted or attached secret, a net command inside a cmd /c body, curl's -u and "
-          "-H, -pSECRET, --pswd, --cred, --signature and -EncodedCommand are all masked  "
-          "<-- pinned defect")
+          "-H, -pSECRET, --pswd, --cred, --signature, -EncodedCommand, -k and a JSON password, secret, "
+          "token or key member are all masked  <-- pinned defect")
+    check(mask_arguments('--data {"author":"bob","n":5}') == '--data {"author":"bob","n":5}',
+          "a JSON member whose name only looks like a secret, such as author, is left alone")
+    spaced = mask_arguments('/i x.msi TARGETDIR="C:\\Program Files\\App" PASSWORD="a b" x"y z"')
+    check(spaced == '/i x.msi TARGETDIR="C:\\Program Files\\App" PASSWORD=*** "***"'
+          and mask_arguments('K="a b" tool') == 'K="a b" tool',
+          "a word with a quoted space, such as msiexec's TARGETDIR=\"C:\\Program Files\\App\", "
+          "does not recurse for ever, and a secret in one is still masked  <-- pinned defect")
     check(all("Hunter2" in mask_arguments(line) for line in (
-        "-k Hunter2", "-usvc:Hunter2", "-U svc%Hunter2", '--data {"password":"Hunter2"}',
-        "--password -Hunter2", '-H "X-Custom: Hunter2"', "-uHunter2")),
+        "-usvc:Hunter2", "-U svc%Hunter2", "--password -Hunter2", '-H "X-Custom: Hunter2"', "-uHunter2")),
           "the documented gaps: these forms still print in full, so the README lists them")
     check(mask_arguments(r"/c net use Z: \\srv\share Hunter2 && robocopy a b", "cmd")
           == "/c net *** *** *** *** && robocopy a b"
@@ -4630,9 +4683,11 @@ def self_test():
             with open(dup_one, "wb") as handle:
                 handle.write(task_xml(uri="\\Jobs\\dup", limit="PT1H").encode("utf-8"))
             code, out, err = cli("--diff", dup_one, dup_folder)
-            check(code == 0 and out == "No differences.\n",
-                  "two files that define one task: the later one wins, and a difference in the "
-                  "dropped file is not reported (a README limit)")
+            swapped = cli("--diff", dup_folder, dup_one)
+            check(code == 1 and out == "" and "dups" in err and "\\Jobs\\dup" in err
+                  and swapped[0] == 1 and "dups" in swapped[2],
+                  "two files that define one task on a side stop --diff, on either side: the "
+                  "verdict never depends on file order  <-- pinned defect")
             off = os.path.join(scratch, "off.xml")
             with open(off, "wb") as handle:
                 handle.write(task_xml(uri="\\Jobs\\off", enabled="false", start="",
@@ -4945,6 +5000,21 @@ def match_notice(args, pattern, tasks):
     return False
 
 
+def repeated_name(tasks):
+    """The first full task name that two definitions share, or None. Pure.
+
+    --diff matches tasks by name, so two definitions of one name on a side would hide one of
+    them and the verdict would depend on file order.
+    """
+    seen = set()
+    for task in tasks:
+        key = full_task_name(task).lower()
+        if key in seen:
+            return full_task_name(task)
+        seen.add(key)
+    return None
+
+
 def main(argv=None):
     parser = Parser(
         prog="taskpulse",
@@ -5045,6 +5115,12 @@ def main(argv=None):
             return 1
         if match_notice(args, pattern, sides[0] + sides[1]):
             return 1
+        for path, side in zip(args.diff, sides):
+            name = repeated_name(side)
+            if name:
+                sys.stderr.write("taskpulse: %s holds more than one task named %s; compare one "
+                                 "export of each task\n" % (path, name))
+                return 1
         rows = diff_tasks(*sides)
         rows = [row for row in rows if pattern.search(row["task"])]
         return emit(rows, args, diff=True) or (2 if rows else 0)

@@ -74,6 +74,7 @@ PASS  a 322 naming a running instance neither ends it nor moves its start  <-- p
 PASS  a run with no end event on a task that is Ready or Queued is a lost end event, not a stuck run  <-- pinned defect
 ...
 PASS  a run that is only 2 hours old is STUCK when later launches were ignored because it was still running (event 322)  <-- pinned defect
+PASS  a task the scheduler says is Running since a launch 24 hours or more ago is STUCK although this read holds no start event for the run; Ready, Queued and a missing launch time are not  <-- pinned defect
 ...
 PASS  a history read that failed ignores any fate: nothing was read, so nothing is judged  <-- pinned defect
 ...
@@ -123,7 +124,8 @@ PASS  a timestamp past the last UTC instant is None, not an OverflowError  <-- p
 ...
 PASS  a logon change on a task that runs ArcGIS Pro's Python also names the licence conditions  <-- pinned defect
 ...
-PASS  a quoted or attached secret, a net command inside a cmd /c body, curl's -u and -H, -pSECRET, --pswd, --cred, --signature and -EncodedCommand are all masked  <-- pinned defect
+PASS  a quoted or attached secret, a net command inside a cmd /c body, curl's -u and -H, -pSECRET, --pswd, --cred, --signature, -EncodedCommand, -k and a JSON password, secret, token or key member are all masked  <-- pinned defect
+PASS  a word with a quoted space, such as msiexec's TARGETDIR="C:\Program Files\App", does not recurse for ever, and a secret in one is still masked  <-- pinned defect
 ...
 PASS  --diff of a net use inside cmd /c prints neither password  <-- pinned defect
 ...
@@ -166,6 +168,7 @@ PASS  --out as a hard link to the export is refused  <-- pinned defect
 PASS  a prefix of --apply, such as --ap, is refused and writes nothing  <-- pinned defect
 ...
 PASS  --diff --match that matches no task is not a clean diff  <-- pinned defect
+PASS  two files that define one task on a side stop --diff, on either side: the verdict never depends on file order  <-- pinned defect
 ...
 PASS  --diff of two exports that hold only Microsoft's own tasks has no result: exit 1 and a notice, never 'No differences'  <-- pinned defect
 ...
@@ -185,10 +188,10 @@ PASS  importing taskpulse runs nothing and prints nothing
 PASS  the import probe writes no .pyc beside the script  <-- pinned defect
 os message table: present
 --------------------------------------------------------------------
-677 assertions, 0 failed
+680 assertions, 0 failed
 ```
 
-The same command prints `677 assertions, 0 failed` on Windows with Python 3.13, 3.12 and 3.9, and
+The same command prints `680 assertions, 0 failed` on Windows with Python 3.13, 3.12 and 3.9, and
 on Ubuntu with Python 3.12. On Linux there is no OS message table, so the line above the footer
 rule reads `os message table: absent, so its assertions check the unmapped fallback`. Six
 assertions then check the `unmapped result 0x...` text instead of the Windows wording, and the
@@ -305,7 +308,7 @@ cd taskpulse
 python taskpulse.py --self-test
 ```
 
-That is the whole setup. `--self-test` runs 677 assertions with no network, no credentials and
+That is the whole setup. `--self-test` runs 680 assertions with no network, no credentials and
 no Task Scheduler access, so it passes on a locked-down box. Then run
 `python taskpulse.py` for the health report, `python taskpulse.py --lint` for the lint, or
 `python taskpulse.py --diff old.xml new.xml` to compare two exports.
@@ -661,19 +664,20 @@ never arms. Run a cold `--history` now and then to see it.
 A launch can end in ways that no `201` event records, and that `Last Run Result` hides behind
 the last good run. Windows lists them in the log's provider manifest. This table is from
 `Get-WinEvent -ListProvider Microsoft-Windows-TaskScheduler`, reading its `Events`, on Windows
-11 build 26100. The names are the manifest's own.
+11 build 26100. The `Manifest name` column holds the `Name` of each event's task in that
+manifest.
 
 | Event | Manifest name | Fields it carries | What taskpulse makes of it |
 |---|---|---|---|
-| `101` | Task Start Failed | task, user, result code | A run of its own, because no instance existed. It is an `Error`, and counts as a failure. |
-| `103` | Action start failed | task, instance, user, result code | The run is an `Error`. |
-| `203` | Action failed to start | task, instance, action, result code | The run is an `Error`. |
-| `111` | Task terminated | task, instance | The run is over and is a `Warning`. |
-| `329` | Task stopping due to timeout reached | task, instance | The run is over and is an `Error`: the scheduler stopped it for exceeding its time limit. |
-| `330` | Task stopping due to user request | task, instance, user | The run is over and is a `Warning`. |
-| `153` | Missed task start rejected | task | A refused launch of kind `missed`. |
-| `322` | Launch request ignored, instance already running | task, the running instance | A refused launch of kind `overlap`. It names the instance that was still running. |
-| `332` | Launch condition not met, user not logged-on | task, user | A refused launch of kind `no-session`. |
+| `101` | `TaskStartFail` | task, user, result code | A run of its own, because no instance existed. It is an `Error`, and counts as a failure. |
+| `103` | `TaskFailure` | task, instance, user, result code | The run is an `Error`. |
+| `203` | `ActionFailedToStart` | task, instance, action, result code | The run is an `Error`. |
+| `111` | `TaskTerminated` | task, instance | The run is over and is a `Warning`. |
+| `329` | `StoppingOnTimeout` | task, instance | The run is over and is an `Error`: the scheduler stopped it for exceeding its time limit. |
+| `330` | `StoppingOnRequest` | task, instance, user | The run is over and is a `Warning`. |
+| `153` | `MissedTaskRejected` | task | A refused launch of kind `missed`. |
+| `322` | `NewInstanceIgnored` | task, the running instance | A refused launch of kind `overlap`. It names the instance that was still running. |
+| `332` | `NoStartUserNotLogged` | task, user | A refused launch of kind `no-session`. |
 
 A run that `111`, `329` or `330` ended gets no end time and no duration, so it never reaches
 the duration baseline. That rule assumes Windows logs no `102` after the termination. If it
@@ -688,7 +692,10 @@ Two rules turn those events into a verdict for each task:
   and either the run began `--stuck-hours` ago or more (default 24), or Task Scheduler logged
   a `322` that names the run's instance. A task whose state is `Ready` is not running, so a run
   with no end event there is a lost end event, and it is not called stuck. A state that is
-  missing, as in an export, rules nothing out.
+  missing, as in an export, rules nothing out. A task whose live `state` is `Running` and whose
+  last launch was `--stuck-hours` ago or more is also STUCK, even when the log holds no start
+  event for that run, because the event is older than the log, than `--history` or than the
+  5000-event cap.
 * **BLOCKED.** The task is not stuck, and its latest refused launch inside the window is newer
   than its latest start in this read, so nothing has run since. The window is the one the run
   columns use: the last 7 days, or everything since the watermark.
@@ -761,8 +768,8 @@ The arguments of an action can hold a secret, and a diff prints both sides. So i
 through `mask_arguments`, which replaces with `***`: the value of a switch whose name holds
 `key`, `token`, `secret`, `pass`, `pw`, `pswd`, `cred`, `auth` (but not `author`), `bearer`,
 `signature` or `encodedcommand`, or is `sas`, `sig`, `pat` or `rp`; the value of a one-letter
-`-P` or `-p`, which is the password of `sqlcmd` and `mysql`, and the rest of an attached
-`-pSECRET` or `-PSECRET` (but not a PowerShell parameter such as `-Path` or `-Port`); the word
+`-P`, `-p` or `-k`, which are the password of `sqlcmd` and `mysql` and a common name for a key, and the rest of an attached
+`-pSECRET` or `-PSECRET` (but not a PowerShell parameter such as `-Path` or `-Port`); the value of a JSON member whose name holds `key`, `token`, `secret`, `pass`, `pw`, `cred`, `auth` (but not `author`), `bearer` or `signature`, as in `{"password":"X"}`; the word
 after such a switch that has no value of its own; a value, quoted or not, that has spaces in it
 and follows such a switch; a value with `=` or `+` in it and no file extension, which is how
 base64 keys and connection strings look; the password in the `user:password@host` of a URL; the
@@ -773,7 +780,7 @@ of `net`, which takes its password by position. That holds for a `net` command i
 or `-Command` body too, up to the next `&`, `|` or `;`. A `cmd /c` body is masked word by word.
 When a secret changes and the mask makes both sides read the same, the row says `(a value
 changed that is not printed)`, so the change is not lost. The self-test greps the table, the
-`csv` and the `json` of seven such changes for the secrets, and finds none. It masks 27 more
+`csv` and the `json` of seven such changes for the secrets, and finds none. It masks 32 more
 command-line shapes, from `-Password "a b"` to `curl -u user:pass`, and checks each one. The
 program field is masked the same way when it holds a command line, as in `sync.exe --password
 x`.
@@ -912,9 +919,11 @@ apart gets ignored the first night it reports one.
   cannot be checked against the documentation. The other way is to import `arcpy` as the
   task's account, which needs that account, takes a licence, and is not read-only. An S4U job
   with only local paths still lints clean.
-* **STUCK needs the run's start in the same read.** taskpulse keeps nothing between runs. With
-  a watermark, a run whose `100` event an earlier read took has no row in this read, and
-  nothing marks it stuck. Its next refused launch (`322`) still leaves the task `BLOCKED`. A
+* **STUCK needs the run's start in the same read, or a live `Running` state.** taskpulse keeps
+  nothing between runs. With a watermark, a run whose `100` event an earlier read took has no
+  row in this read. A task that Task Scheduler still reports as `Running` since a launch
+  `--stuck-hours` ago or more is STUCK all the same. A task that is not running now is not,
+  and its next refused launch (`322`) leaves it `BLOCKED`. A
   cold `--history` sees the whole window and finds it. A task with no instance that Task
   Scheduler logged, such as one that hangs before its first event, has nothing to be stuck on.
 * **The run-fate path was exercised with synthetic events.** The Operational log of the
@@ -1231,9 +1240,9 @@ apart gets ignored the first night it reports one.
 * **The diff reads exports, not the live scheduler.** The live read does not return every trigger
   field, action field and setting, so `--diff` takes two paths. To compare today with a past
   day, export today (`schtasks /query /xml ONE > today.xml`) and keep the earlier file.
-* **The diff matches names, and a rename is not a move.** Two files that define the same task
-  collide: the later one wins, and the diff does not say so. A task renamed between exports is
-  one removed and one added task, not a change.
+* **The diff matches names, and a rename is not a move.** A task renamed between exports is
+  one removed and one added task, not a change. Two tasks with one name on one side stop the
+  diff with exit `1`.
 * **The diff does not normalise values it cannot prove equal.** `PT72H` and `P3D` are the same
   limit, and they are two values to the diff. Triggers compare without regard to case, so a
   trigger whose only change is the case of a text value is no change. A run level that one
@@ -1241,9 +1250,9 @@ apart gets ignored the first night it reports one.
   no default for it. The same holds for any `Settings` element that has no default in the
   schema.
 * **The argument mask is a set of patterns.** It masks a secret by its switch name, by the
-  letter of a one-letter `-P` or `-p`, by `-u` or `--user` with a `:` in the value, and by the
-  name of a header. These secrets still print in full: `-k X`, the attached `-uuser:X`, `-uX`,
-  `-U user%X`, a JSON body such as `--data {"password":"X"}`, a header with another name such
+  letter of a one-letter `-P`, `-p` or `-k`, by `-u` or `--user` with a `:` in the value, and by the
+  name of a header. These secrets still print in full: the attached `-uuser:X`, `-uX`,
+  `-U user%X`, a header with another name such
   as `-H "X-Custom: X"`, and a secret switch whose value starts with `-` or `/`, such as
   `--password -X`, which is read as the next switch. The csv and json diff output and any
   `--out` file are redacted no further than the table. The self-test pins what the mask hides,
@@ -1270,9 +1279,9 @@ apart gets ignored the first night it reports one.
   write, such as a different export or the script itself, is replaced.
 * **`--lint` skips disabled tasks.** A folder of only disabled tasks prints `No findings.` and
   exits `0`.
-* **Keep one file per task in an export folder.** `--diff` and `--lint` key a task by its path,
-  so two files that define the same task collide, the later one wins, and a difference in the
-  dropped file prints `No differences.` with exit `0`.
+* **Keep one file per task in an export folder.** `--diff` keys a task by its full name, so two
+  files that define one task on the same side stop it with exit `1` and a message that names the
+  folder and the task. `--lint` does not check for this and judges both.
 * **No check reads `DisallowStartIfOnBatteries` or `StopIfGoingOnBatteries`.** Both default to
   true, and on battery power they skip or stop runs without an error, as on a laptop or a
   host behind a UPS. The lint lists them among the defaults and never judges them.
@@ -1290,6 +1299,53 @@ apart gets ignored the first night it reports one.
   consequence instead: a start that was missed and not made up is event `153`, and leaves the
   task `BLOCKED` if nothing has run since.
 * **There is no network path**, so there is nothing to test against a stub server.
+* **Mutation survivors are test gaps, not wrong output today.** A mutation run tried 120
+  changes to the code, and 110 were caught by the self-test. Seven survivors are real gaps:
+  a refusal at exactly the run's start time (`late-ge`), a refusal at exactly the 7-day cutoff
+  (`counted-gt`), which of several stuck runs the detail names (`stuck-max`), a 2-2-1 tie in
+  logon types, where the README says a tie names nobody (`lint-minority-tie`), the pairing of
+  unmatched triggers (`diff-trigger-order`), the case of `Arguments` in `--diff`
+  (`diff-actions-args-lower`) and the `--match` filter in `--diff` (`diff-match-after`). Three
+  more changes (`wait-kind`, `rank-ge`, `lint-settings-none`) leave the output the same.
+  The run was made before the last round of fixes, at 677 assertions.
+* **The `WHY` column quotes Windows for the last result.** A run that event `329` ended for
+  exceeding its time limit shows the text `The last run of the task was terminated by the
+  user.`, because the status comes from result code `0x41306`. The failure count and the run
+  status are right.
+* **A task meant to run for ever is STUCK.** A daemon that starts at logon or at startup is
+  reported STUCK after `--stuck-hours` and stays STUCK. The only way to exclude one is a
+  `--match` regex.
+* **The busy-log numbers come from one observation.** The figures of about 700 to 1000 events
+  a day come from a single server, were seen once and were not reproduced.
+* **A bare positional secret prints in full in `--diff`.** In `x.py SECRET` nothing in the XML
+  says that the word is a secret. The mask also leaves these forms: a value after a switch
+  with a neutral name (`--cookie X`, `--session X`, `--jwt X`, `--pin X`, `--otp X`, `--dsn X`,
+  `--connection-string X`, `-ArgumentList X`), a literal in a PowerShell `-Command` body such
+  as `$p = 'X'`, a literal in parentheses after a secret switch such as
+  `-Password (ConvertTo-SecureString 'X' -AsPlainText)`, the Oracle form `user/password@db`,
+  the value of `-SecureString` and of any one-letter switch other than `-p`, `-P` and `-k`,
+  and the abbreviations `-enc`, `-ec` and `-e` of `-EncodedCommand`. A one-character account
+  in `-u a:X` is not masked, because the pattern needs two characters before the colon. A
+  secret inside the `Command` field itself prints in the health report's `target`; Windows
+  puts arguments in `Arguments`, which is masked.
+* **The header mask is slow on one crafted word.** A word of 60000 characters that repeats
+  `key` takes about 4 seconds in `--diff`, and an ordinary long word does not. Only a crafted
+  export is slow.
+* **A folder with a file that is not task XML stops the run.** `--lint` or `--diff` of a
+  folder that holds `notes.txt` ends with exit `1` and `no <Task> element found`. The failure
+  is loud, not a false pass.
+* **`--diff --out` with `--apply` writes an alternate data stream of an input.** On NTFS,
+  `--out old.xml:s1` is not refused. The input file stays as it was and only the stream is
+  created.
+* **The live read lists the tasks Task Scheduler returns to the calling account.** Whether an
+  unelevated run misses a task whose access list denies it was not measured. Run the health
+  report and the lint elevated for a full inventory.
+* **`--local-drives` with an empty value or a path such as `C:\` matches no drive letter.**
+  Every drive, `C:` included, is then reported as a mapped drive. Pass bare letters, as in
+  `--local-drives C,D`.
+* **The self-test writes task XML to a temporary folder.** It creates the folder with
+  `tempfile.mkdtemp` and removes it in a `finally` block. It writes nowhere else. The files its
+  own `--apply` tests produce go into that folder too.
 
 ## Contributing
 
