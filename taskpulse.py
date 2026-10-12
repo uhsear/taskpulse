@@ -14,6 +14,13 @@ relative, a share the run-as account cannot reach, a program found only through 
 exported task XML (schtasks /query /xml, Export-ScheduledTask, or the files under
 C:\\Windows\\System32\\Tasks), --lint needs no Task Scheduler and runs on any OS.
 
+--history also reads what happened to a launch that never became a normal run: a start that
+failed (events 101, 103, 203), a run the scheduler or a person ended (111, 329, 330) and a
+launch that was refused (153, 322, 332). A run that never finishes is STUCK. A task whose latest
+launch was refused is BLOCKED. --diff OLD NEW compares two exports of the same tasks and names
+each field that changed, with the Task Scheduler schema defaults applied, so an element that
+was absent in one export and explicit in the other is no change.
+
 What it refuses to do:
 
   * never creates, edits, enables, disables, deletes, starts or stops a task
@@ -25,7 +32,8 @@ What it refuses to do:
 Exit codes: 0 = nothing in an Error state and taskpulse saw everything it reports on, 2 = at
 least one task (or, with --lint, one finding) in an Error state, 1 = taskpulse itself failed
 or could not see everything (a task it could not fully read, or a --history read that failed
-or is incomplete), 64 = usage error. Suitable as a monitoring check.
+or is incomplete), 64 = usage error. With --diff, 0 = the two exports match and 2 = they
+differ. Suitable as a monitoring check.
 
 Python 3.9+, standard library only.
 """
@@ -50,8 +58,9 @@ import tempfile
 import xml.etree.ElementTree as ET
 from contextlib import redirect_stderr, redirect_stdout
 from datetime import datetime, timedelta, timezone
+from itertools import zip_longest
 
-__version__ = "1.3.0"
+__version__ = "1.4.0"
 
 # Task Scheduler status codes (SCHED_S_*). These are "success" HRESULTs that mean
 # something other than "the job ran and worked".
@@ -107,7 +116,31 @@ DURATION_ANOMALY_LOW_RATIO = 0.33
 
 # One fetch of the Operational log. See history_query for why the count matters.
 HISTORY_MAX_EVENTS = 5000
-HISTORY_EVENT_IDS = (100, 102, 200, 201)
+HISTORY_EVENT_IDS = (100, 101, 102, 103, 111, 153, 200, 201, 203, 322, 329, 330, 332)
+
+# Run-fate events. Every id and field below comes from the provider manifest of the log:
+# Get-WinEvent -ListProvider Microsoft-Windows-TaskScheduler, read on Windows 11 build 26100.
+# 101 "Task Start Failed" has no instance id, because it fires before an instance exists. 103
+# "Action start failed" and 203 "Action failed to start" carry one, and a ResultCode.
+LAUNCH_FAILED_IDS = frozenset([101, 103, 203])
+# 111 "Task terminated", 329 "stopping due to timeout reached" and 330 "stopping due to user
+# request". The scheduler or a person ended the instance. None carries a result code.
+STOP_FATES = {111: "Terminated", 329: "TimedOut", 330: "Stopped"}
+# A launch that was refused, not a run. 153 "Missed task start rejected" and 332 "user not
+# logged-on" name only the task. 322 "instance already running" names the instance that was
+# still running, not a new one.
+BLOCK_KINDS = {153: "missed", 322: "overlap", 332: "no-session"}
+BLOCK_TEXT = {
+    "overlap": "the latest launch was ignored because an earlier run was still going (event 322)",
+    "no-session": "the latest launch was refused because the run-as user was not logged on "
+                  "(event 332)",
+    "missed": "the latest scheduled start was missed and not made up (event 153; see the "
+              "StartWhenAvailable setting)",
+}
+# The worst fate of an instance wins when it has several events.
+FATE_RANK = {"": 0, "Stopped": 1, "Terminated": 2, "TimedOut": 3, "LaunchFailed": 4}
+# A run with no end event after this many hours is STUCK (--stuck-hours changes it).
+STUCK_HOURS = 24
 
 # --lint vocabulary. The XML schema and the PowerShell enum spell the same logon types
 # differently (InteractiveToken / Interactive), so both collapse to one word here.
@@ -153,8 +186,13 @@ BODY_SWITCH = {"cmd": r"/[ck]", "powershell": PS_BODY, "pwsh": PS_BODY}
 # Switch names whose value is a secret. That value is never judged as a path and never
 # printed; only the share check reads it (see arg_values). "pass" covers --pass, password,
 # passwd and passphrase; "pw" covers plink's -pw and pwd. A one-letter -P or -p is left out:
-# it is a port or a path as often as a password.
-SECRET_SWITCH = re.compile(r"key|token|secret|pass|pw|credential", re.IGNORECASE)
+# it is a port or a path as often as a password. Only --diff's mask adds them (MASKED_LETTERS).
+SECRET_SWITCH = re.compile(r"key|token|secret|pass|pw|credential|auth(?!or)|bearer",
+                          re.IGNORECASE)
+# --diff prints command lines, so it also masks the value of a one-letter -P or -p, which is
+# sqlcmd's and mysql's password. A port after -p is masked too: a changed port is reported as a
+# change whose value is not printed, which costs nothing, where a printed password costs a lot.
+MASKED_LETTERS = frozenset(["p", "P"])
 # Switch names whose value is an account, such as net use's /user:EXAMPLE\svc. An account is
 # not a path, although DOMAIN\name has a separator. A one-letter -u is left out: to python it
 # is a switch with no value, so the script after it would be lost.
@@ -163,6 +201,8 @@ USER_SWITCH = re.compile(r"^(?:user(?:name)?|login|ru)$", re.IGNORECASE)
 # known extension, such as Hunter2/Secret after a switch with a neutral name, may be a secret.
 NAMED_EXTS = PATH_EXTS | {".exe"}
 ROOTED = re.compile(r"^(?:[A-Za-z]:[\\/]|[\\/]|%)")
+# The password in the user:password@host of a URL.
+URL_AUTH = re.compile(r"(://[^/\s:@]*:)[^@/\s]*@")
 # A share as \\server\share, //server/share or the long form \\?\UNC\server\share. It is
 # matched against switch values (see arg_values), not the raw command line, so the share in
 # /LOG:\\server\share is found. The lookbehind stops the // of a URL from reading as a share.
@@ -175,6 +215,39 @@ UNC = re.compile(r"(?<![\\/\w:])(?:\\\\\?\\UNC\\|[\\/]{2})"
 DRIVE = re.compile(r"(?<![A-Za-z0-9_])([A-Za-z]):(?=[\\/\s\"']|$|[^\s\"':]*[.\\/])")
 XML_DECL = re.compile(r"<\?xml[^>]*\?>")
 SYSTEM32 = "C:\\Windows\\System32"
+# What Task Scheduler assumes for a Settings element that an export leaves out. Every value is
+# the default="..." of settingsType in the Task Scheduler schema, except ExecutionTimeLimit: the
+# schema gives it none, and the ITaskSettings documentation says "By default, a task will be
+# stopped 72 hours after it starts to run". Windows writes most of these explicitly, so an
+# absent element mostly means a hand-written export. The principal's LogonType and RunLevel
+# have no documented default, so they get none here.
+SETTING_DEFAULTS = {
+    "AllowStartOnDemand": "true", "MultipleInstancesPolicy": "IgnoreNew",
+    "DisallowStartIfOnBatteries": "true", "StopIfGoingOnBatteries": "true",
+    "AllowHardTerminate": "true", "StartWhenAvailable": "false",
+    "RunOnlyIfNetworkAvailable": "false", "WakeToRun": "false", "Enabled": "true",
+    "Hidden": "false", "DeleteExpiredTaskAfter": "PT0S", "Priority": "7",
+    "RunOnlyIfIdle": "false", "UseUnifiedSchedulingEngine": "false",
+    "DisallowStartOnRemoteAppSession": "false", "ExecutionTimeLimit": "PT72H",
+}
+# What a hung run does to the launches behind it, by MultipleInstancesPolicy.
+HANG_EFFECT = {
+    "ignorenew": "every later launch is dropped without an error (Task Scheduler logs each as "
+                 "event 322, which --history reports)",
+    "queue": "every later launch waits behind it",
+    "parallel": "later launches pile up beside it",
+}
+# ArcGIS Pro's own Python: the folder Esri documents for propy and proenv, the default conda
+# environment arcgispro-py3, and the propy launcher itself.
+ARCGIS_PYTHON = re.compile(r"arcgis[\\/]pro[\\/]bin[\\/]python|arcgispro-py3|\bpropy\b",
+                           re.IGNORECASE)
+# Esri's four conditions are "Sign me in automatically", Pro open, Pro authorized to work
+# offline, and "Remember my certificate" (the README lists them with their source).
+LICENCE_NOTE = (
+    "this task runs ArcGIS Pro's Python: arcpy raises RuntimeError: NotInitialized unless Esri's "
+    "sign-in conditions hold for the account that runs it, and a task definition does not show "
+    "them, so check them for the new account or logon type")
+DIFF_FIELDS = ["change", "task", "field", "old", "new"]
 
 PS_QUERY = r"""
 $ErrorActionPreference = "Stop"
@@ -240,6 +313,28 @@ $rows = foreach ($task in Get-ScheduledTask) {
             Where-Object { $_ } | Select-Object -Unique) -join " | "
     } catch { $failed += "triggers" }
 
+    # The settings --lint judges, under the schema's own names, and each trigger's end
+    # boundary. Only what --lint reads is asked for; the XML reader keeps the rest for --diff.
+    $settings = @{}
+    try {
+        $settings = @{
+            MultipleInstancesPolicy   = [string]$task.Settings.MultipleInstances
+            ExecutionTimeLimit        = [string]$task.Settings.ExecutionTimeLimit
+            RunOnlyIfIdle             = [string]$task.Settings.RunOnlyIfIdle
+            RunOnlyIfNetworkAvailable = [string]$task.Settings.RunOnlyIfNetworkAvailable
+        }
+    } catch { $failed += "settings" }
+    $triggerDetails = @()
+    try {
+        foreach ($g in @($task.Triggers)) {
+            $triggerDetails += [pscustomobject]@{
+                kind         = Get-TriggerTypeName $g
+                enabled      = ($g.Enabled -ne $false)
+                end_boundary = [string]$g.EndBoundary
+            }
+        }
+    } catch { $failed += "triggers" }
+
     [pscustomobject]@{
         task_name             = [string]$task.TaskName
         task_path             = [string]$task.TaskPath
@@ -252,6 +347,8 @@ $rows = foreach ($task in Get-ScheduledTask) {
         arguments             = $args
         actions               = $actions
         trigger_types         = $triggerTypes
+        trigger_details       = $triggerDetails
+        settings              = $settings
         last_run_time         = if ($info) { Convert-ToIsoUtcOrNull $info.LastRunTime } else { $null }
         next_run_time         = if ($info) { Convert-ToIsoUtcOrNull $info.NextRunTime } else { $null }
         last_task_result      = if ($info) { [int64]$info.LastTaskResult } else { $null }
@@ -429,11 +526,12 @@ def parse_dt(value):
     text = re.sub(r"(\.\d{6})\d+", r"\1", text.replace("Z", "+00:00"))
     try:
         parsed = datetime.fromisoformat(text)
-    except ValueError:
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        # 9999-12-31T23:59:59-05:00 is past the last UTC instant a datetime holds.
+        return parsed.astimezone(timezone.utc)
+    except (ValueError, OverflowError):
         return None
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=timezone.utc)
-    return parsed.astimezone(timezone.utc)
 
 
 def trigger_tokens(trigger_types):
@@ -526,6 +624,16 @@ def script_words(tokens):
     return words
 
 
+def shown_program(exe):
+    """The program field as it may be printed. A field that holds a command line is masked.
+
+    Task Scheduler takes a whole command line in Command when Arguments is empty, so
+    `sync.exe --password x` can be the program. mask_arguments() is for the arguments; a plain
+    path is returned as it is.
+    """
+    return mask_arguments(exe) if re.search(r"\s", exe) else exe
+
+
 def classify_command(executable, arguments):
     """Find the real script behind an interpreter invocation.
 
@@ -534,6 +642,7 @@ def classify_command(executable, arguments):
     part of the report Windows genuinely does not give you.
     """
     exe = unquote(executable)
+    shown = shown_program(exe)
     tokens = [unquote(token) for token in split_args(arguments)]
     lowered = [token.lower() for token in tokens]
     name = program_name(exe)
@@ -544,12 +653,12 @@ def classify_command(executable, arguments):
             if token and not token.startswith("-") and extension_of(token) in (".py", ".pyw"):
                 return token, "PythonScript"
         if "-c" in lowered:
-            return exe, "PythonInline"
+            return shown, "PythonInline"
         if "-m" in lowered:
             index = lowered.index("-m")
             if index + 1 < len(tokens):
                 return tokens[index + 1], "PythonModule"
-        return exe, "Python"
+        return shown, "Python"
 
     if name in POWERSHELL_EXES:
         for index, token in enumerate(lowered):
@@ -559,25 +668,25 @@ def classify_command(executable, arguments):
             if token and not token.startswith("-") and extension_of(token) == ".ps1":
                 return token, "PowerShellScript"
         if "-command" in lowered or "-c" in lowered or "-encodedcommand" in lowered:
-            return exe, "PowerShellInline"
-        return exe, "PowerShell"
+            return shown, "PowerShellInline"
+        return shown, "PowerShell"
 
     if name in CMD_EXES:
         for token in script_words(tokens):
             if token and token[0] not in "/-" and extension_of(token) in (".bat", ".cmd"):
                 return token, "BatchScript"
-        return exe, "CommandShell"
+        return shown, "CommandShell"
 
     if name in SCRIPT_HOST_EXES:
         for token in tokens:
             token_ext = extension_of(token)
             if token and token[0] not in "/-" and token_ext in (".vbs", ".js"):
                 return token, "VBScript" if token_ext == ".vbs" else "JavaScript"
-        return exe, "ScriptHost"
+        return shown, "ScriptHost"
 
     if ext in EXT_KIND:
-        return exe, EXT_KIND[ext]
-    return exe, "Executable" if exe else ""
+        return shown, EXT_KIND[ext]
+    return shown, "Executable" if exe else ""
 
 
 def read_failures(task):
@@ -686,7 +795,7 @@ def duration_ratio(stats):
     return last / mean
 
 
-def evaluate(task, now=None, stats=None, history="off"):
+def evaluate(task, now=None, stats=None, history="off", fate=None):
     """Enrich one raw task dict into a report row. Pure: dict in, dict out.
 
     `stats` is this task's entry from summarize_runs() when --history ran, else None. The
@@ -694,6 +803,9 @@ def evaluate(task, now=None, stats=None, history="off"):
     `history` is how the run columns were read: "off" (no --history), "failed", "incomplete"
     (the counts are a lower bound) or "complete". Unread run counts are None, never 0: a saved
     report of a failed read must not match a clean read of an empty week.
+    `fate` is this task's entry from judge_fates(). A STUCK or BLOCKED task is at least a
+    Warning, so the default report keeps its row; the exit code still follows the snapshot
+    alone, because a Warning never makes it non-zero.
     """
     target, kind = classify_command(task.get("executable"), task.get("arguments"))
     status = health_status(task, now)
@@ -705,6 +817,11 @@ def evaluate(task, now=None, stats=None, history="off"):
     failures = int(stats.get("failures_last_7_days", 0) or 0) if read else None
     runs = int(stats.get("runs_last_7_days", 0) or 0) if read else None
     reasons = [attention_reason(task, status, now)]
+    fate = (fate or {}) if read else {}
+    if fate.get("fate"):
+        reasons.insert(0, fate["detail"])  # first: the table cuts a cell at 60 characters
+        if status in ("Success", "NotYetRun", "Running"):
+            status = "Warning"
     if failures:
         # The whole point of --history: a task whose last run was green can have failed every
         # night for weeks, and the snapshot Task Scheduler keeps has one slot.
@@ -736,6 +853,8 @@ def evaluate(task, now=None, stats=None, history="off"):
         "last_duration_seconds": stats.get("last_duration_seconds"),
         "duration_ratio": round(ratio, 3) if ratio is not None else None,
         "is_duration_anomaly": anomaly,
+        "fate": fate.get("fate", ""),
+        "blocked_launches_last_7_days": int(fate.get("blocked_launches", 0)) if read else None,
     }
 
 
@@ -752,18 +871,28 @@ def result_rank(code):
     return 2
 
 
-def run_status(end_time, code):
+def worse_fate(one, other):
+    """The more serious of two fates (see FATE_RANK)."""
+    return one if FATE_RANK[one] >= FATE_RANK[other] else other
+
+
+def run_status(end_time, code, fate=""):
     """Verdict for one run in the event log, not for the task as a whole.
 
     A failed action is an Error at once, even before the run's 102: a watermark read that lands
-    mid-run must count it, because the next read sees only the rest of the run. Otherwise a
-    run with no 102 event has not finished, and a finished run with no 201 event recorded no
-    result, which is Unknown rather than Success.
+    mid-run must count it, because the next read sees only the rest of the run. A run whose
+    start failed, or that the scheduler stopped for exceeding its time limit, is an Error too,
+    whatever codes it has. A run the scheduler terminated or a person stopped is a Warning, and
+    it is over, whether or not a 102 followed. Otherwise a run with no 102 event has not
+    finished, and a finished run with no 201 event recorded no result, which is Unknown rather
+    than Success.
     """
     normalized = to_unsigned(code)
     rank = None if normalized is None else result_rank(normalized)
-    if rank == 2:
+    if rank == 2 or fate in ("LaunchFailed", "TimedOut"):
         return "Error"
+    if fate in ("Terminated", "Stopped"):
+        return "Warning"
     if not text_of(end_time):
         return "Running"
     if rank is None:
@@ -771,10 +900,21 @@ def run_status(end_time, code):
     return "Success" if rank == 0 else "Warning"
 
 
+def task_names(tasks):
+    """The full names of the inventory's tasks, which an event must name to join to one."""
+    return set(full_task_name(task) for task in tasks if text_of(task.get("task_name")))
+
+
 def build_run_rows(events, tasks):
     """Group Operational-log events into one row per run instance. Pure: events in, rows out.
 
-    Events 100 and 102 bracket a run and 201 carries the result code. A run whose 100 event
+    Events 100 and 102 bracket a run and 201 carries the result code. Events 103 and 203 (the
+    action could not start) carry a result code too and make the run a failure. Events 111, 329
+    and 330 say the scheduler or a person ended the instance; they set the row's fate but not
+    its end time, so such a run gets no duration and never reaches the baseline. Event 101 (the
+    task could not start at all) has no instance, so it is a row of its own, named after its
+    record. Events 153, 322 and 332 are refused launches, not runs; build_block_rows() takes
+    them. A run whose 100 event
     fell outside the fetch window used to emit a run with no start time at all - dozens of such
     rows in the table this was ported from - so the earliest observed event time is used instead
     and the row carries start_time_estimated, which stops an estimate reading as a
@@ -784,12 +924,18 @@ def build_run_rows(events, tasks):
     An event naming a task that is not in `tasks` is skipped, so a filtered inventory yields a
     filtered history rather than rows nothing can be joined to.
     """
-    known = set(full_task_name(task) for task in tasks if text_of(task.get("task_name")))
+    known = task_names(tasks)
     grouped = {}
 
     for raw in events:
+        event_id = to_int(raw.get("event_id"))
+        if event_id in BLOCK_KINDS:
+            continue
         instance_id = text_of(raw.get("instance_id"))
         task_name = text_of(raw.get("task_full_name"))
+        if not instance_id and event_id == 101:
+            instance_id = "launch-" + (text_of(raw.get("event_record_id"))
+                                       or text_of(raw.get("event_time_utc")))
         if not instance_id or task_name not in known:
             continue
         group = grouped.setdefault(instance_id, {
@@ -799,9 +945,9 @@ def build_run_rows(events, tasks):
             "end_time": None,
             "first_event_time": None,
             "result_code": None,
+            "fate": "",
         })
 
-        event_id = to_int(raw.get("event_id"))
         event_time = text_of(raw.get("event_time_utc"))
         event_dt = parse_dt(event_time)
 
@@ -817,7 +963,11 @@ def build_run_rows(events, tasks):
                 existing = parse_dt(group["end_time"])
                 if existing is None or event_dt > existing:
                     group["end_time"] = event_time
-        if event_id == 201:
+        if event_id in LAUNCH_FAILED_IDS:
+            group["fate"] = worse_fate(group["fate"], "LaunchFailed")
+        elif event_id in STOP_FATES:
+            group["fate"] = worse_fate(group["fate"], STOP_FATES[event_id])
+        if event_id == 201 or event_id in LAUNCH_FAILED_IDS:
             code = to_unsigned(raw.get("result_code"))
             # One 201 per action, read in either order: the worst code wins, so a failed
             # action is never hidden by another action's success or warning code.
@@ -850,10 +1000,18 @@ def build_run_rows(events, tasks):
             "end_time": text_of(group["end_time"]),
             "duration_seconds": duration,
             "result_code": group["result_code"],
-            "run_status": run_status(group["end_time"], group["result_code"]),
+            "fate": group["fate"],
+            "run_status": run_status(group["end_time"], group["result_code"], group["fate"]),
         })
     rows.sort(key=lambda row: (row["task"].lower(), row["start_time"]))
     return rows
+
+
+def history_window(now, since_record_id=None):
+    """(cutoff, label) of the runs the history columns count. The cutoff is None past a watermark."""
+    cutoff = None if since_record_id is not None else now - timedelta(days=7)
+    return cutoff, (("since record %d" % since_record_id) if cutoff is None
+                    else "in the last 7 days")
 
 
 def summarize_runs(run_rows, now, since_record_id=None):
@@ -869,8 +1027,7 @@ def summarize_runs(run_rows, now, since_record_id=None):
     clock and called the wall clock inside the cutoff, so every test written against a pinned
     clock passed on the day it was written and failed a week later.
     """
-    cutoff = None if since_record_id is not None else now - timedelta(days=7)
-    window = ("since record %d" % since_record_id) if cutoff is None else "in the last 7 days"
+    cutoff, window = history_window(now, since_record_id)
     summary = {}
 
     for run in run_rows:
@@ -902,6 +1059,86 @@ def summarize_runs(run_rows, now, since_record_id=None):
         count = entry["completed_run_count"]
         entry["mean_duration_seconds"] = (total / count) if count else None
     return summary
+
+
+def build_block_rows(events, tasks):
+    """The launches that Task Scheduler refused, one row each, oldest first. Pure.
+
+    Events 153 (a missed start was not made up), 322 (the task was still running) and 332 (the
+    run-as user was not logged on) say a launch was refused. None of them is a run, and none
+    starts one. A 322 names the instance that was still running, which judge_fates() uses to
+    tie the refusals to a run that never ends. An event for a task outside the inventory, or
+    with no usable time, is skipped, as in build_run_rows().
+    """
+    known = task_names(tasks)
+    rows = []
+    for raw in events:
+        kind = BLOCK_KINDS.get(to_int(raw.get("event_id")))
+        when = text_of(raw.get("event_time_utc"))
+        task_name = text_of(raw.get("task_full_name"))
+        if kind is None or task_name not in known or parse_dt(when) is None:
+            continue
+        rows.append({"task": task_name, "kind": kind, "time": when,
+                     "instance_id": text_of(raw.get("instance_id"))})
+    rows.sort(key=lambda row: (row["task"].lower(), parse_dt(row["time"])))
+    return rows
+
+
+def judge_fates(run_rows, block_rows, tasks, now, since_record_id=None, stuck_hours=STUCK_HOURS):
+    """STUCK, BLOCKED or neither for each task that has a run or a refused launch. Pure.
+
+    STUCK: a run has no end event, and the task's own state does not say otherwise, and either
+    the run began `stuck_hours` or more ago, or a later launch was refused because it was still
+    running (event 322). A task whose state is Ready or Queued is not running, so a run with no
+    end event is a lost end event, not a stuck run. A state that is missing, as in an XML
+    export, does not rule a run out.
+
+    BLOCKED: not stuck, and the latest launch refused inside the window came after the task's
+    latest start in this read, so nothing has run since. The window is the one the run columns
+    use (see history_window), and `blocked_launches` counts every refusal inside it.
+
+    Each entry is {fate, detail, blocked_launches}; fate is "" for a task that is neither.
+    """
+    cutoff, _ = history_window(now, since_record_id)
+    states = dict((full_task_name(task), text_of(task.get("state")).lower()) for task in tasks)
+    runs, blocks = {}, {}
+    for row in run_rows:
+        runs.setdefault(row["task"], []).append(row)
+    for row in block_rows:
+        blocks.setdefault(row["task"], []).append(row)
+    verdicts = {}
+    for name in sorted(set(runs) | set(blocks)):
+        refused = blocks.get(name, [])
+        counted = [row for row in refused
+                   if cutoff is None or parse_dt(row["time"]) >= cutoff]
+        stuck = []
+        if states.get(name, "") not in ("ready", "queued"):
+            for run in runs.get(name, []):
+                started = parse_dt(run["start_time"])
+                if run["run_status"] != "Running" or started is None:
+                    continue
+                waiting = len([row for row in refused if row["kind"] == "overlap"
+                               and row["instance_id"] == run["instance_id"]])
+                hours = (now - started).total_seconds() / 3600.0
+                if waiting or hours >= stuck_hours:
+                    stuck.append((hours, waiting))
+        starts = [parse_dt(run["start_time"]) for run in runs.get(name, [])]
+        last_start = max([when for when in starts if when] or [None])
+        late = [row for row in counted if last_start is None or parse_dt(row["time"]) > last_start]
+        fate, detail = "", ""
+        if stuck:
+            hours, waiting = max(stuck)
+            fate = "STUCK"
+            detail = "STUCK: a run started %.1f hour(s) ago has not finished" % hours
+            if waiting:
+                detail += "; %d later launch(es) were ignored while it ran (event 322)" % waiting
+        elif late:
+            latest = max(late, key=lambda row: parse_dt(row["time"]))
+            fate = "BLOCKED"
+            detail = "BLOCKED: %s at %s" % (BLOCK_TEXT[latest["kind"]],
+                                           parse_dt(latest["time"]).strftime("%Y-%m-%dT%H:%MZ"))
+        verdicts[name] = {"fate": fate, "detail": detail, "blocked_launches": len(counted)}
+    return verdicts
 
 
 def is_microsoft_task(task):
@@ -1027,7 +1264,57 @@ def changes_directory(executable, arguments):
         switch_drive or folder[:1] in "\\/" or folder[0].upper() == SYSTEM32[0])
 
 
-def lint_task(task, local_drives=("C",)):
+def as_list(value):
+    """A list for a value that ConvertTo-Json may have unwrapped to one object, or left out."""
+    value = value or []
+    return [value] if isinstance(value, dict) else value
+
+
+def effective_setting(task, name):
+    """A task's setting, lowercased: the task's own value, else the schema default."""
+    return text_of((task.get("settings") or {}).get(name) or SETTING_DEFAULTS[name]).lower()
+
+
+def unlimited(duration):
+    """True for an ISO 8601 duration of zero, such as PT0S: Task Scheduler's 'run indefinitely'."""
+    return duration.upper().startswith("P") and re.search(r"[1-9]", duration) is None
+
+
+def logon_minorities(tasks):
+    """{task name: detail} for each enabled task whose logon type its neighbours do not share.
+
+    Neighbours are the enabled tasks in the same folder that run as the same account. A logon
+    type counts as the majority only when two or more neighbours share it and no other type
+    has as many, so a tie names nobody. A heuristic, not a Task Scheduler rule: a task can
+    differ on purpose, and the finding is a Warning for that reason. It is how a settings
+    change that flips one nightly job to another logon type shows up beside the jobs it used
+    to match.
+    """
+    groups = {}
+    for task in tasks:
+        kind = LOGON_KINDS.get(text_of(task.get("logon_type")).lower(), "")
+        user = text_of(task.get("run_as_user"))
+        if task.get("enabled", True) and kind and user:
+            folder = (text_of(task.get("task_path")) or "\\").lower()
+            groups.setdefault((folder, user.lower()), []).append((full_task_name(task), kind, user))
+    found = {}
+    for members in groups.values():
+        counts = {}
+        for _, kind, _ in members:
+            counts[kind] = counts.get(kind, 0) + 1
+        top = [kind for kind, count in counts.items() if count == max(counts.values())]
+        if len(top) != 1 or counts[top[0]] < 2:
+            continue
+        for name, kind, user in members:
+            if counts[kind] == 1:
+                found[name] = (
+                    "logon type %s differs from the %d other task(s) in this folder that run as "
+                    "%s, which use %s: if this is not deliberate, a settings change flipped it"
+                    % (kind, counts[top[0]], user, top[0]))
+    return found
+
+
+def lint_task(task, local_drives=("C",), now=None):
     """Configuration findings for one task. Pure: task dict in, list of finding dicts out.
 
     `task` is a read_tasks() row or a parse_task_xml() row: it needs logon_type,
@@ -1035,6 +1322,10 @@ def lint_task(task, local_drives=("C",)):
     working_directory}. Each finding is {task, severity, check, detail}; severity is Error
     when the next run cannot work as configured and Warning when it depends on something
     this tool cannot see offline, such as whether D: is a mapped drive.
+
+    A task with a `settings` dict, as both readers give, is also judged for the ways it skips
+    runs without an error, with the schema defaults applied to what it leaves out (see
+    SETTING_DEFAULTS). `now` turns on the one check that needs a clock, an expired trigger.
     """
     name = full_task_name(task)
     findings = []
@@ -1128,18 +1419,50 @@ def lint_task(task, local_drives=("C",)):
         if bare and not re.search(r"[\\/%]", bare) and stem not in SYSTEM_PROGRAMS:
             add("Warning", "bare-program",
                 "%s has no folder, so it resolves against Start In and then the run-as "
-                "account's PATH; which program runs, if any, depends on that account" % bare)
+                "account's PATH; which program runs, if any, depends on that account"
+                % shown_program(bare))
+
+    settings = task.get("settings")
+    if settings is not None:
+        policy = effective_setting(task, "MultipleInstancesPolicy")
+        if unlimited(effective_setting(task, "ExecutionTimeLimit")) and policy != "stopexisting":
+            # Event 322 is what Task Scheduler logs for each launch that IgnoreNew drops.
+            add("Warning", "no-time-limit",
+                "ExecutionTimeLimit is %s (run indefinitely), so a hung run never ends and %s"
+                % (settings["ExecutionTimeLimit"],
+                   HANG_EFFECT.get(policy, "later launches are affected")))
+        waits = [label for name, label in (("RunOnlyIfIdle", "the computer is idle"),
+                                           ("RunOnlyIfNetworkAvailable", "a network is available"))
+                 if effective_setting(task, name) == "true"]
+        if waits:
+            add("Warning", "run-conditions",
+                "the task is set to run only when %s: a trigger that fires while that is false "
+                "can leave the run unstarted, and Last Run Result then still shows the previous "
+                "run" % " and ".join(waits))
+
+    live = [t for t in as_list(task.get("trigger_details")) if t.get("enabled", True)]
+    ends = [parse_dt(t.get("end_boundary")) for t in live]
+    # A time with no offset is the machine's local time, which an export does not say, so a
+    # trigger counts as ended only a day after its EndBoundary: the zone cannot change that.
+    if now and live and all(end and end < now - timedelta(days=1) for end in ends):
+        add("Warning", "trigger-expired",
+            "every enabled trigger ended (the latest EndBoundary is %s), so the task cannot start "
+            "again; Task Scheduler reports 0x00041304 (no more runs), which the health report "
+            "does not count as an error" % max(ends).strftime("%Y-%m-%dT%H:%MZ"))
     return findings
 
 
-def lint_rows(tasks, local_drives=("C",), show_ok=False):
+def lint_rows(tasks, local_drives=("C",), show_ok=False, now=None):
     """Findings for every enabled task, Errors first. show_ok adds one OK row per clean task."""
     rows = []
+    # ponytail: a disabled task cannot fail a run, so it is not linted; re-enable, re-lint.
+    tasks = [task for task in tasks if task.get("enabled", True)]
+    minority = logon_minorities(tasks)
     for task in tasks:
-        # ponytail: a disabled task cannot fail a run, so it is not linted; re-enable, re-lint.
-        if not task.get("enabled", True):
-            continue
-        found = lint_task(task, local_drives)
+        found = lint_task(task, local_drives, now)
+        if full_task_name(task) in minority:
+            found.append({"task": full_task_name(task), "severity": "Warning",
+                          "check": "logon-minority", "detail": minority[full_task_name(task)]})
         clean = [{"task": full_task_name(task), "severity": "OK", "check": "",
                   "detail": "no findings"}] if show_ok else []
         rows.extend(found or clean)
@@ -1195,6 +1518,24 @@ def xml_text(node, *path):
     return text_of(found.text) if found is not None else ""
 
 
+def xml_leaves(node, prefix=""):
+    """Every element with text and no children below `node`, as sorted (dotted path, text) pairs.
+
+    Used for what --diff compares and cannot name in advance: a trigger's schedule, a setting's
+    sub-elements, an action's fields. A comment has no name, so it adds nothing.
+    """
+    pairs = []
+    for child in (node if node is not None else []):
+        name = local_name(child.tag)
+        if not name:
+            continue
+        if len(child):
+            pairs.extend(xml_leaves(child, prefix + name + "."))
+        else:
+            pairs.append((prefix + name, text_of(child.text)))
+    return sorted(pairs)
+
+
 def split_task_uri(uri):
     r"""\Folder\Name to (task_path, task_name), so full_task_name() gives the URI back."""
     uri = uri.replace("/", "\\")
@@ -1231,6 +1572,16 @@ def task_from_xml(node, name):
         "task_name": task_name,
         "enabled": xml_text(node, "Settings", "Enabled").lower() != "false",
         "run_as_user": user or group,
+        "run_level": xml_text(principal, "RunLevel"),
+        # Only what the XML says; lint_task and diff_tasks apply the schema defaults.
+        "settings": dict(xml_leaves(xml_first(node, "Settings"))),
+        "trigger_details": [
+            {"kind": trigger_name(t), "enabled": xml_text(t, "Enabled").lower() != "false",
+             "end_boundary": xml_text(t, "EndBoundary"), "leaves": xml_leaves(t)}
+            for t in (triggers if triggers is not None else []) if local_name(t.tag)],
+        "action_details": [{"kind": local_name(a.tag), "leaves": xml_leaves(a)}
+                           for a in (actions if actions is not None else [])
+                           if local_name(a.tag)],
         # A group principal runs only in a member's session, whatever else is set.
         "logon_type": xml_text(principal, "LogonType") or ("Group" if group and not user else ""),
         # A disabled trigger never fires, so it is not one of the task's triggers.
@@ -1316,6 +1667,154 @@ def read_task_files(paths, walk=os.walk, islink=os.path.islink):
             except ValueError as error:
                 raise ValueError("%s: %s" % (filename, error))
     return tasks
+
+
+# --------------------------------------------------------------------------
+# task definition diff (--diff) - pure: two lists of parsed tasks in, rows out
+# --------------------------------------------------------------------------
+
+def mask_arguments(arguments, program=""):
+    r"""A command line with every value that could be a secret replaced by ***.
+
+    The rules of arg_values(), kept to what a diff prints: the value of a secret switch
+    (SECRET_SWITCH), the word after a secret switch that has no value of its own, a value
+    with '=' or '+' in it and no known file extension, which base64 keys and connection
+    strings have, and the password in the user:password@host of a URL. Every argument of `net` is masked, because `net use \\srv\share <password>`
+    takes its password by position. A word that holds spaces, such as the body of cmd /c, is
+    masked word by word. A value after a one-letter switch is not masked, except -P and -p
+    (MASKED_LETTERS); the attached form -pSECRET is not (see the README).
+    """
+    if program == "net":
+        return "***" if text_of(arguments) else ""
+    words, secret_next = [], False
+    for token in split_args(arguments):
+        value = unquote(token)
+        secret, secret_next = secret_next, False
+        if re.search(r"\s", value):
+            words.append('"%s"' % mask_arguments(value))
+            continue
+        value = URL_AUTH.sub(r"\1***@", value)
+        head = ""
+        if value[:1] in ("-", "/") and value[:2] != "//":
+            dashes, name, sep, value = re.match(r"([-/]*)([^=:]*)([=:]?)(.*)", value).groups()
+            head = dashes + name + sep
+            secret = bool(SECRET_SWITCH.search(name)) or name in MASKED_LETTERS
+            secret_next = secret and not value
+        opaque = re.search(r"[=+]", value) and extension_of(value) not in PATH_EXTS
+        words.append(head + ("***" if value and (secret or opaque) else value))
+    return " ".join(words)
+
+
+def describe_action(action):
+    """(compare key, shown text) of one child of Actions. The text masks secrets."""
+    fields = dict(action["leaves"])
+    if action["kind"] != "Exec":
+        return (action["kind"], tuple(action["leaves"])), (
+            "%s %s" % (action["kind"], fields.get("ClassId", ""))).strip()
+    command = fields.get("Command", "")
+    args = fields.get("Arguments", "")
+    start = fields.get("WorkingDirectory", "")
+    shown = "Exec " + " ".join(part for part in (
+        mask_arguments(command), mask_arguments(args, program_name(command))) if part)
+    return (command.lower(), args, start.lower()), shown + (
+        " [Start In %s]" % start if start else "")
+
+
+def describe_trigger(trigger):
+    """(compare key, shown text) of one trigger. Enabled is true when the export says nothing."""
+    # A list, not a dict: a monthly trigger repeats <Day>, and a dict keeps only one of them.
+    pairs = list(trigger["leaves"])
+    if not any(name == "Enabled" for name, _ in pairs):
+        pairs.append(("Enabled", "true"))
+    pairs.sort()
+    return (trigger["kind"].lower() + "|" + ";".join(
+        "%s=%s" % (name.lower(), value.lower()) for name, value in pairs),
+        trigger["kind"] + " " + ", ".join("%s=%s" % pair for pair in pairs))
+
+
+def unmatched(old, new):
+    """(old shown, new shown) pairs of the entries that two lists of (key, shown) do not share.
+
+    Order does not matter, and a repeated entry is matched as often as it repeats. What is left
+    is paired in key order; the shorter side is padded with blanks.
+    """
+    rest = sorted(new)
+    gone = []
+    for item in sorted(old):
+        matches = [other for other in rest if other[0] == item[0]]
+        if matches:
+            rest.remove(matches[0])
+        else:
+            gone.append(item)
+    return list(zip_longest([item[1] for item in gone], [item[1] for item in rest], fillvalue=""))
+
+
+def compare_tasks(old, new):
+    """(field, old shown, new shown) for each difference between two parses of one task.
+
+    Compared: the account, its logon type and run level; each Settings element, with the schema
+    default for one that only a side leaves out; the triggers, in any order; and the actions, in
+    order. Not compared: RegistrationInfo (date, author, description), which changes on every
+    re-registration and does not change what runs. An argument that holds a secret is masked,
+    and a change to one that the mask hides says so.
+    """
+    changes = []
+
+    def pair(value, key=None):
+        return (text_of(value).lower() if key is None else key, text_of(value))
+
+    def differ(field, before, after):
+        if before[0] != after[0]:
+            note = " (a value changed that is not printed)" if before[1] == after[1] else ""
+            changes.append((field, before[1], after[1] + note))
+
+    def logon(task):
+        kind = text_of(task.get("logon_type"))
+        return pair(kind, LOGON_KINDS.get(kind.lower(), kind.lower()))
+
+    differ("run as", pair(old.get("run_as_user")), pair(new.get("run_as_user")))
+    differ("logon type", logon(old), logon(new))
+    differ("run level", pair(old.get("run_level")), pair(new.get("run_level")))
+    before, after = old.get("settings") or {}, new.get("settings") or {}
+    for name in sorted(set(before) | set(after)):
+        default = SETTING_DEFAULTS.get(name, "")
+        differ("enabled" if name == "Enabled" else "setting " + name,
+               pair(before.get(name) or default), pair(after.get(name) or default))
+    for gone, added in unmatched([describe_trigger(t) for t in old.get("trigger_details") or []],
+                                 [describe_trigger(t) for t in new.get("trigger_details") or []]):
+        changes.append(("trigger", gone, added))
+    was = [describe_action(a) for a in old.get("action_details") or []]
+    now = [describe_action(a) for a in new.get("action_details") or []]
+    for index in range(max(len(was), len(now))):
+        differ("action %d" % (index + 1), was[index] if index < len(was) else ("", ""),
+               now[index] if index < len(now) else ("", ""))
+    runs_arcgis = any(ARCGIS_PYTHON.search("%s %s" % (a.get("executable", ""),
+                                                      a.get("arguments", "")))
+                      for a in (old.get("actions") or []) + (new.get("actions") or []))
+    if runs_arcgis and set(c[0] for c in changes) & set(["run as", "logon type", "run level"]):
+        changes.append(("arcpy-licence", "", LICENCE_NOTE))
+    return changes
+
+
+def diff_tasks(old_tasks, new_tasks):
+    """One row per difference between two sets of parsed tasks, tasks in name order. Pure.
+
+    A task is matched by its full name, ignoring case, as Windows does. A task in only one set
+    is added or removed; a rename is both. Rows are {change, task, field, old, new}.
+    """
+    olds = dict((full_task_name(task).lower(), task) for task in old_tasks)
+    news = dict((full_task_name(task).lower(), task) for task in new_tasks)
+    rows = []
+    for key in sorted(set(olds) | set(news)):
+        if key not in news or key not in olds:
+            rows.append({"change": "removed" if key not in news else "added",
+                         "task": full_task_name(olds.get(key) or news[key]),
+                         "field": "", "old": "", "new": ""})
+            continue
+        rows.extend({"change": "changed", "task": full_task_name(news[key]), "field": field,
+                     "old": before, "new": after}
+                    for field, before, after in compare_tasks(olds[key], news[key]))
+    return rows
 
 
 # --------------------------------------------------------------------------
@@ -1482,13 +1981,13 @@ def render_table(rows, columns=COLUMNS, header=TABLE_HEADER, cap=60):
     return "\n".join(out)
 
 
-def write_output(rows, fmt, stream, lint=False):
-    """Write health rows, or lint findings when `lint`, as table, json or csv."""
+def write_output(rows, fmt, stream, lint=False, diff=False):
+    """Write health rows, lint findings when `lint`, or diff rows when `diff`, in `fmt`."""
     if fmt == "json":
         json.dump(rows, stream, indent=2, sort_keys=True)
         stream.write("\n")
     elif fmt == "csv":
-        fields = LINT_FIELDS if lint else list(evaluate({}).keys())
+        fields = DIFF_FIELDS if diff else LINT_FIELDS if lint else list(evaluate({}).keys())
         writer = csv.DictWriter(stream, fieldnames=fields, lineterminator="\n")
         writer.writeheader()
         for row in rows:
@@ -1497,6 +1996,9 @@ def write_output(rows, fmt, stream, lint=False):
             writer.writerow(dict((key, "'" + value if isinstance(value, str)
                                   and value[:1] in ("=", "+", "-", "@", "\t", "\r") else value)
                                  for key, value in row.items()))
+    elif diff:
+        stream.write(render_table(rows, DIFF_FIELDS, [f.upper() for f in DIFF_FIELDS], 240)
+                     + "\n" if rows else "No differences.\n")
     elif lint:
         # The detail is the point of a finding, so its column is allowed to run long.
         stream.write(render_table(rows, LINT_FIELDS, [f.upper() for f in LINT_FIELDS], 240)
@@ -1550,11 +2052,13 @@ def task_xml(uri="\\Jobs\\refresh", logon="Password", user="EXAMPLE\\svc-etl",
              trigger="<CalendarTrigger><ScheduleByDay><DaysInterval>1</DaysInterval>"
                      "</ScheduleByDay></CalendarTrigger>",
              command="C:\\Python39\\python.exe", arguments="C:\\jobs\\refresh.py",
-             start="C:\\jobs", enabled="", namespace=True):
+             start="C:\\jobs", enabled="", namespace=True, limit="", settings=""):
     """A synthetic exported task for the self-test. Every account and share is made up.
 
     Like a real export, an enabled task has no <Enabled> element: Windows writes one only as
-    <Enabled>false</Enabled>.
+    <Enabled>false</Enabled>. It leaves out an <ExecutionTimeLimit> that equals the 72-hour
+    default (measured on a development machine), so `limit` is empty here unless a case needs one.
+    `settings` adds more Settings elements.
     """
     return (
         '<Task version="1.2"%s><RegistrationInfo>%s</RegistrationInfo>'
@@ -1564,7 +2068,9 @@ def task_xml(uri="\\Jobs\\refresh", logon="Password", user="EXAMPLE\\svc-etl",
         % (' xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task"' if namespace else "",
            "<URI>%s</URI>" % uri if uri else "", user,
            "<LogonType>%s</LogonType>" % logon if logon else "",
-           "<Enabled>%s</Enabled>" % enabled if enabled else "", trigger, command,
+           ("<Enabled>%s</Enabled>" % enabled if enabled else "")
+           + ("<ExecutionTimeLimit>%s</ExecutionTimeLimit>" % limit if limit else "") + settings,
+           trigger, command,
            "<Arguments>%s</Arguments>" % arguments if arguments else "",
            "<WorkingDirectory>%s</WorkingDirectory>" % start if start else ""))
 
@@ -2017,7 +2523,9 @@ def self_test():
           "a cold start on a log that holds 6.5 days, not 7, is incomplete too")
 
     # --- which end of the log the event cap keeps (--history) ---
-    ids = "(EventID=100 or EventID=102 or EventID=200 or EventID=201)"
+    ids = ("(EventID=100 or EventID=101 or EventID=102 or EventID=103 or EventID=111 or "
+           "EventID=153 or EventID=200 or EventID=201 or EventID=203 or EventID=322 or "
+           "EventID=329 or EventID=330 or EventID=332)")
     check(history_query(30, 1) == ("*[System[(EventRecordID > 1) and %s]]" % ids, True),
           "past a watermark the read is oldest first, so a backlog is never skipped, and "
           "takes no time window  <-- pinned defect")
@@ -2265,6 +2773,210 @@ def self_test():
           "a task path with no trailing separator still joins to the event log's name")
     check(evaluate(inventory[0])["task"] == full_task_name(inventory[0]),
           "both sides of the history join build the task name the same way")
+
+    # --- run fate: the ways a launch ends that are not a normal run (--history) ---
+    check(HISTORY_EVENT_IDS == (100, 101, 102, 103, 111, 153, 200, 201, 203, 322, 329, 330, 332),
+          "the history read asks for the nine run-fate events as well as the four lifecycle "
+          "events")
+    check(len(HISTORY_EVENT_IDS) <= 21 and sorted(HISTORY_EVENT_IDS) == list(HISTORY_EVENT_IDS),
+          "the event filter stays under the XPath clause limit measured with the time window, "
+          "which is 21")
+    failed_start = build_run_rows([event(100, 1, record_id=80),
+                                   event(103, 1, record_id=81, result_code=-2147024894)],
+                                  inventory)
+    check(len(failed_start) == 1 and failed_start[0]["fate"] == "LaunchFailed"
+          and failed_start[0]["run_status"] == "Error" and failed_start[0]["result_code"]
+          == 0x80070002 and failed_start[0]["duration_seconds"] is None,
+          "event 103, the action could not start, makes the run an Error with its code, though "
+          "no 102 or 201 followed  <-- pinned defect")
+    check(build_run_rows([event(203, 2, record_id=82, result_code=-2147024894),
+                          event(100, 1, record_id=83), event(102, 3, record_id=84)],
+                         inventory)[0]["run_status"] == "Error",
+          "event 203 on a run that still ended with a 102 is an Error too  <-- pinned defect")
+    check(build_run_rows([event(100, 1), event(203, 2, result_code=0)],
+                         inventory)[0]["run_status"] == "Error",
+          "a launch failure with a success code is still a failure: the event says it did not "
+          "start")
+    lone = build_run_rows([event(101, 3, instance="", record_id=77, result_code=-2147024894),
+                           event(101, 4, instance="", record_id=78, result_code=-2147024894)],
+                          inventory)
+    check(len(lone) == 2 and lone[0]["instance_id"] == "launch-77"
+          and lone[0]["run_status"] == "Error" and lone[0]["fate"] == "LaunchFailed"
+          and lone[0]["start_time_estimated"] == 1 and lone[0]["duration_seconds"] is None
+          and lone[0]["result_code"] == 0x80070002,
+          "event 101 has no instance id, because no instance existed: each is a run of its own, "
+          "named after its record, and an Error  <-- pinned defect")
+    check(build_run_rows([event(101, 3, instance="", record_id=None)],
+                         inventory)[0]["instance_id"] == "launch-2026-07-28T03:00:00Z",
+          "an event 101 with no record id is named after its time")
+    check(build_run_rows([event(101, 3, instance="", record_id=77, task=r"\Jobs\other")],
+                         inventory) == [],
+          "an event 101 for a task outside the inventory is skipped")
+    nameless = dict(event(101, 3, instance="", record_id=None), event_time_utc=None)
+    check(build_run_rows([nameless], inventory) == [],
+          "an event 101 with neither a record id nor a time is dropped, not filed as a run")
+    check(build_run_rows([event(100, 1, record_id=85), event(102, 2, record_id=86)],
+                         inventory)[0]["fate"] == "",
+          "a normal run has no fate")
+    stops = {}
+    for stop_id, label in ((111, "Terminated"), (329, "TimedOut"), (330, "Stopped")):
+        stops[stop_id] = build_run_rows([event(100, 1, record_id=90), event(stop_id, 2,
+                                                                            record_id=91)],
+                                        inventory)[0]
+        check(stops[stop_id]["fate"] == label and stops[stop_id]["duration_seconds"] is None,
+              "event %d sets the fate %s and, with no 102, no duration" % (stop_id, label))
+    check([stops[i]["run_status"] for i in (111, 329, 330)] == ["Warning", "Error", "Warning"]
+          and stops[111]["end_time"] == "",
+          "a terminated or user-stopped run is a Warning and over, a run stopped for exceeding "
+          "its time limit is an Error, and none of them is Running  <-- pinned defect")
+    ended = build_run_rows([event(100, 1), event(111, 2), event(102, 3)], inventory)[0]
+    check(ended["run_status"] == "Warning" and ended["duration_seconds"] == 7200.0,
+          "a terminated run that also wrote a 102 keeps its duration and stays a Warning")
+    check([build_run_rows(order, inventory)[0]["fate"] for order in (
+        [event(330, 2), event(329, 3)], [event(329, 3), event(330, 2)],
+        [event(329, 2), event(111, 3)], [event(111, 2), event(329, 3)],
+        [event(111, 2), event(330, 3)], [event(330, 2), event(111, 3)])]
+        == ["TimedOut"] * 4 + ["Terminated"] * 2,
+        "the worst fate of an instance wins, whatever order its events are read in")
+    check(worse_fate("", "Stopped") == "Stopped" and worse_fate("LaunchFailed", "TimedOut")
+          == "LaunchFailed" and worse_fate("Stopped", "") == "Stopped",
+          "worse_fate ranks launch failure above a timeout above termination above a stop")
+    check(run_status(None, None, "LaunchFailed") == "Error"
+          and run_status(None, None, "TimedOut") == "Error"
+          and run_status(None, None, "Terminated") == "Warning"
+          and run_status(None, None, "Stopped") == "Warning"
+          and run_status(None, 0, "") == "Running" and run_status("x", 0) == "Success",
+          "a fate decides the run's status, and no fate leaves run_status as it was")
+    check(build_run_rows([event(322, 2), event(332, 3, instance=""), event(153, 4, instance="")],
+                         inventory) == [],
+          "a refused launch (153, 322, 332) is not a run and starts none")
+    overlapped = build_run_rows([event(100, 1, record_id=92), event(322, 5, record_id=93)],
+                                inventory)
+    check(len(overlapped) == 1 and overlapped[0]["start_time"] == "2026-07-28T01:00:00Z"
+          and overlapped[0]["run_status"] == "Running",
+          "a 322 naming a running instance neither ends it nor moves its start  <-- pinned defect")
+
+    refusals = build_block_rows([
+        event(332, 6, instance="", record_id=1), event(322, 2, instance="i1", record_id=2),
+        event(153, 4, instance="", record_id=3), event(100, 1, record_id=4),
+        event(322, 3, task=r"\Jobs\other"), dict(event(332, 5), event_time_utc=None)], inventory)
+    check([(row["kind"], row["instance_id"]) for row in refusals]
+          == [("overlap", "i1"), ("missed", ""), ("no-session", "")]
+          and refusals[0]["task"] == r"\Jobs\etl",
+          "refused launches come out oldest first, each with its kind, and a 322 keeps the "
+          "instance that was still running; a run event, an unknown task and an undated event "
+          "are left out")
+
+    stuck_now = datetime(2026, 7, 28, 12, 0, tzinfo=timezone.utc)
+
+    def go(started, state="Running", blocks=(), status="Running", **options):
+        """judge_fates over one run that began at `started` (hours ago) on a task in `state`."""
+        started_at = (stuck_now - timedelta(hours=started)).isoformat() if started else ""
+        runs = [{"task": r"\Jobs\etl", "instance_id": "r1", "start_time": started_at,
+                 "run_status": status}]
+        tasks = [dict(inventory[0], state=state)] if state else [
+            {k: v for k, v in inventory[0].items() if k != "state"}]
+        got = judge_fates(runs, list(blocks), tasks, stuck_now, **options)
+        return got.get(r"\Jobs\etl", {})
+
+    def refusal(kind, hours_ago, instance=""):
+        return {"task": r"\Jobs\etl", "kind": kind, "instance_id": instance,
+                "time": (stuck_now - timedelta(hours=hours_ago)).isoformat()}
+
+    verdict = go(59)
+    check(verdict["fate"] == "STUCK" and "59.0 hour(s) ago has not finished" in verdict["detail"]
+          and verdict["blocked_launches"] == 0,
+          "a run with no end event after 59 hours on a Running task is STUCK")
+    check(go(23.9)["fate"] == "" and go(24)["fate"] == "STUCK",
+          "the threshold is 24 hours, and a run of exactly 24 hours is stuck")
+    check(go(59, stuck_hours=72)["fate"] == "" and go(59, stuck_hours=48)["fate"] == "STUCK",
+          "--stuck-hours moves the threshold")
+    check(go(59, state="Ready")["fate"] == "" and go(59, state="Queued")["fate"] == "",
+          "a run with no end event on a task that is Ready or Queued is a lost end event, not a "
+          "stuck run  <-- pinned defect")
+    check(go(59, state="")["fate"] == "STUCK" and go(59, state="Disabled")["fate"] == "STUCK",
+          "a task whose state is unknown, as in an export, or disabled with a run still going "
+          "can be stuck")
+    check(go(59, status="Success")["fate"] == "" and go(59, status="Error")["fate"] == "",
+          "only a run with no end is stuck: a finished run is not, however old")
+    check(go(0)["fate"] == "",
+          "a run row with no usable start time is skipped, not a crash")
+    waiting = go(2, blocks=[refusal("overlap", 1, "r1"), refusal("overlap", 0.5, "r1")])
+    check(waiting["fate"] == "STUCK" and "2 later launch(es) were ignored while it ran (event 322)"
+          in waiting["detail"] and "2.0 hour(s) ago" in waiting["detail"]
+          and waiting["blocked_launches"] == 2,
+          "a run that is only 2 hours old is STUCK when later launches were ignored because it "
+          "was still running (event 322)  <-- pinned defect")
+    check(go(2, blocks=[refusal("overlap", 1, "other")])["fate"] == "BLOCKED",
+          "a 322 that names another instance does not make this run stuck; it blocks the task")
+    check(go(2, blocks=[refusal("no-session", 1)])["fate"] == "BLOCKED",
+          "a refused launch after a young run's start does not make it stuck; it blocks the task")
+    check(go(59, blocks=[refusal("no-session", 1)])["fate"] == "STUCK",
+          "STUCK wins over BLOCKED")
+
+    def finished(started, blocks, **options):
+        """judge_fates for a task whose only run began `started` hours ago and ended."""
+        return go(started, state="Ready", blocks=blocks, status="Success", **options)
+
+    blocked = finished(10, [refusal("no-session", 5)])
+    check(blocked["fate"] == "BLOCKED" and blocked["blocked_launches"] == 1
+          and "BLOCKED: the latest launch was refused because the run-as user was not logged on "
+          "(event 332) at 2026-07-28T07:00Z" == blocked["detail"],
+          "a launch refused after the task's last start leaves it BLOCKED, with the time")
+    check(finished(3, [refusal("no-session", 5)])["fate"] == ""
+          and finished(3, [refusal("no-session", 5)])["blocked_launches"] == 1,
+          "a refusal before the task's last start is counted but does not leave it BLOCKED")
+    check("event 322" in finished(10, [refusal("overlap", 5, "gone")])["detail"]
+          and "event 153" in finished(10, [refusal("missed", 5)])["detail"]
+          and "StartWhenAvailable" in finished(10, [refusal("missed", 5)])["detail"],
+          "each kind of refusal names its event, and a missed start names the setting")
+    latest = [refusal("no-session", 6), refusal("overlap", 5, "g")]
+    check("event 322" in finished(10, latest)["detail"]
+          and "event 322" in finished(10, latest[::-1])["detail"]
+          and "event 332" in finished(10, [refusal("overlap", 6, "g"),
+                                           refusal("no-session", 5)])["detail"],
+          "the latest refusal names the cause, whatever order the rows arrive in")
+    only = judge_fates([], [refusal("missed", 5)], [inventory[0]], stuck_now)[r"\Jobs\etl"]
+    check(only["fate"] == "BLOCKED" and only["blocked_launches"] == 1,
+          "a task with a refused launch and no run at all is BLOCKED")
+    old = [refusal("no-session", 9 * 24)]
+    check(finished(10, old)["blocked_launches"] == 0 and finished(10, old)["fate"] == ""
+          and finished(10, old, since_record_id=5)["blocked_launches"] == 1
+          and judge_fates([], old, [inventory[0]], stuck_now, 5)[r"\Jobs\etl"]["fate"]
+          == "BLOCKED",
+          "a refusal older than the 7-day window is not counted on a cold start, and is past a "
+          "watermark, whatever its age")
+    clean = judge_fates([{"task": r"\Jobs\etl", "instance_id": "r1", "run_status": "Success",
+                          "start_time": "2026-07-28T01:00:00Z"}], [], [inventory[0]], stuck_now)
+    check(clean == {r"\Jobs\etl": {"fate": "", "detail": "", "blocked_launches": 0}}
+          and judge_fates([], [], [], stuck_now) == {},
+          "a task with only normal runs has no fate, and no events judge to nothing")
+
+    fate_stats = {"completed_run_count": 0, "mean_duration_seconds": None}
+    stuck_row = evaluate(inventory[0], now, fate_stats, "complete", verdict)
+    check(stuck_row["fate"] == "STUCK" and stuck_row["status"] == "Warning"
+          and "STUCK: a run started 59.0 hour(s) ago" in stuck_row["reason"]
+          and stuck_row["blocked_launches_last_7_days"] == 0,
+          "a STUCK task is a Warning, though its snapshot says success, and the reason says why")
+    check(evaluate(dict(inventory[0], state="Running", last_task_result=TASK_RUNNING), now,
+                   fate_stats, "complete", verdict)["status"] == "Warning"
+          and evaluate(dict(inventory[0], last_task_result=None), now, fate_stats, "complete",
+                       verdict)["status"] == "Warning",
+          "a task that reads as Running or NotYetRun is a Warning once it is STUCK")
+    check(evaluate(dict(inventory[0], last_task_result=1), now, fate_stats, "complete",
+                   verdict)["status"] == "Error"
+          and evaluate(dict(inventory[0], enabled=False), now, fate_stats, "complete",
+                       verdict)["status"] == "Disabled",
+          "a fate never lowers an Error or lifts a Disabled task")
+    unread_fate = evaluate(inventory[0], now, None, "failed", verdict)
+    check(unread_fate["fate"] == "" and unread_fate["blocked_launches_last_7_days"] is None
+          and unread_fate["status"] == "Success" and "STUCK" not in unread_fate["reason"],
+          "a history read that failed ignores any fate: nothing was read, so nothing is "
+          "judged  <-- pinned defect")
+    check(evaluate({})["fate"] == "" and evaluate({})["blocked_launches_last_7_days"] is None
+          and evaluate({}, None, None, "complete")["blocked_launches_last_7_days"] == 0,
+          "a run without --history leaves the fate columns empty, and a complete read of a "
+          "quiet task counts 0 refused launches")
 
     # --- rendering never explodes ---
     check("STATUS" in render_table([row]), "table renders a header")
@@ -2684,13 +3396,25 @@ def self_test():
                                         "working_directory": r"C:\jobs"}]
     check(finding_checks(two) == [("Warning", "bare-program")],
           "every exec action is linted, not only the first")
+    leaky = lint_task(job(command="sync.exe --password Hunter2x", arguments="", start=""))
+    check(all("Hunter2x" not in f["detail"] for f in leaky)
+          and any("sync.exe --password ***" in f["detail"] for f in leaky)
+          and classify_command("sync.exe --password Hunter2x", "")
+          == ("sync.exe --password ***", "Executable")
+          and classify_command("python.exe", "-c x") == ("python.exe", "PythonInline")
+          and classify_command(r"C:\Program Files\x\y.exe", "")
+          == (r"C:\Program Files\x\y.exe", "Executable"),
+          "a secret in the Command field is masked in the lint finding and in the target, and "
+          "a path with spaces is not touched  <-- pinned defect")
     single = job(start="jobs")
     single["actions"] = single["actions"][0]
     check(finding_checks(single) == [("Error", "start-in-relative")],
           "a single action that ConvertTo-Json unwrapped to a bare object is still linted")
     check(lint_task({}) == [], "a task dict with nothing in it has nothing to find")
 
-    lint_inventory = [job(logon="InteractiveToken"),
+    # The interactive job has its own account: beside two stored-password jobs of one account
+    # it would also be the logon-minority outlier, and this block is about the rows' order.
+    lint_inventory = [job(logon="InteractiveToken", user="EXAMPLE\\svc-gis"),
                       dict(job(command="python.exe"), task_name="bare"),
                       dict(job(), task_name="clean"),
                       dict(job(start="jobs"), task_name="off", enabled=False)]
@@ -2840,6 +3564,427 @@ def self_test():
     bare_task = parse_task_xml("<Task/>", "\\bare")[0]
     check(bare_task["actions"] == [] and bare_task["logon_type"] == ""
           and bare_task["run_as_user"] == "", "a task with no principal or actions parses empty")
+
+    # --- exported XML: the settings, triggers and actions that --lint and --diff read ---
+    detailed = parse_task_xml(task_xml(
+        logon="InteractiveToken", limit="PT0S",
+        settings="<MultipleInstancesPolicy>Parallel</MultipleInstancesPolicy><IdleSettings>"
+                 "<Duration>PT10M</Duration></IdleSettings><!-- a note -->",
+        trigger="<CalendarTrigger><!-- c --><StartBoundary>2026-01-01T02:00:00</StartBoundary>"
+                "<EndBoundary>2026-06-01T00:00:00</EndBoundary><ScheduleByDay><DaysInterval>1"
+                "</DaysInterval></ScheduleByDay></CalendarTrigger><LogonTrigger><Enabled>false"
+                "</Enabled></LogonTrigger>").replace(
+        "</Principal>", "<RunLevel>HighestAvailable</RunLevel></Principal>"))[0]
+    check(detailed["settings"] == {"ExecutionTimeLimit": "PT0S",
+                                   "MultipleInstancesPolicy": "Parallel",
+                                   "IdleSettings.Duration": "PT10M"}
+          and detailed["run_level"] == "HighestAvailable",
+          "the XML reader keeps every Settings element as written, nested ones by dotted path, "
+          "and the run level")
+    check(detailed["trigger_details"] == [
+        {"kind": "Daily", "enabled": True, "end_boundary": "2026-06-01T00:00:00",
+         "leaves": [("EndBoundary", "2026-06-01T00:00:00"),
+                    ("ScheduleByDay.DaysInterval", "1"),
+                    ("StartBoundary", "2026-01-01T02:00:00")]},
+        {"kind": "Logon", "enabled": False, "end_boundary": "", "leaves": [("Enabled", "false")]}],
+        "each trigger keeps its kind, whether it is enabled, its end boundary and every field")
+    check(detailed["action_details"] == [{"kind": "Exec", "leaves": [
+        ("Arguments", r"C:\jobs\refresh.py"), ("Command", r"C:\Python39\python.exe"),
+        ("WorkingDirectory", r"C:\jobs")]}],
+        "each action keeps its kind and fields")
+    empty_task = parse_task_xml("<Task/>", "\\bare")[0]
+    check(empty_task["settings"] == {} and empty_task["trigger_details"] == []
+          and empty_task["action_details"] == [] and empty_task["run_level"] == "",
+          "a task with no Settings, triggers or actions parses empty")
+    check(len(parse_task_xml(task_xml(trigger="<!-- none --><LogonTrigger/>"))[0][
+        "trigger_details"]) == 1 and len(parse_task_xml(
+            "<Task><Actions><!-- c --><Exec><Command>x</Command></Exec></Actions></Task>", "\\a")[
+            0]["action_details"]) == 1,
+        "a comment among the triggers or the actions is not one")
+
+    # --- lint: the ways a task skips runs without an error ---
+    def with_settings(**settings):
+        return dict(job(), settings=settings)
+
+    def check_names(task, **options):
+        return [(f["severity"], f["check"]) for f in lint_task(task, **options)]
+
+    unbounded = lint_task(with_settings(ExecutionTimeLimit="PT0S"))
+    check([(f["severity"], f["check"]) for f in unbounded] == [("Warning", "no-time-limit")]
+          and "every later launch is dropped without an error" in unbounded[0]["detail"]
+          and "event 322" in unbounded[0]["detail"] and "PT0S (run indefinitely)"
+          in unbounded[0]["detail"],
+          "an unlimited run on a task with no MultipleInstancesPolicy is a Warning: the schema "
+          "default, IgnoreNew, drops every later launch  <-- pinned defect")
+    check("waits behind it" in lint_task(with_settings(
+        ExecutionTimeLimit="PT0S", MultipleInstancesPolicy="Queue"))[0]["detail"]
+        and "pile up beside it" in lint_task(with_settings(
+            ExecutionTimeLimit="PT0S", MultipleInstancesPolicy="Parallel"))[0]["detail"]
+        and "later launches are affected" in lint_task(with_settings(
+            ExecutionTimeLimit="PT0S", MultipleInstancesPolicy="Weird"))[0]["detail"]
+        and all("322" not in lint_task(with_settings(
+            ExecutionTimeLimit="PT0S", MultipleInstancesPolicy=policy))[0]["detail"]
+            for policy in ("Queue", "Parallel", "Weird")),
+        "the finding says what the policy does to the launches behind a hung run, and names "
+        "event 322 only where launches are dropped  <-- pinned defect")
+    check(check_names(with_settings(ExecutionTimeLimit="PT0S",
+                                    MultipleInstancesPolicy="StopExisting")) == []
+          and check_names(with_settings(ExecutionTimeLimit="PT72H")) == []
+          and check_names(with_settings(ExecutionTimeLimit="PT1H")) == []
+          and check_names(with_settings()) == [] and check_names(job()) == [],
+          "a hung run that the next launch stops, a limit, no setting at all and a task with "
+          "no settings are no finding")
+    check([unlimited(text) for text in ("PT0S", "pt0s", "P0D", "PT0H0M0S", "PT0.5S", "PT72H",
+                                        "P1D", "abc", "")]
+          == [True, True, True, True, False, False, False, False, False],
+          "any ISO 8601 duration of zero is 'run indefinitely', and nothing else is")
+    check(check_names(with_settings(ExecutionTimeLimit="PT0S", MultipleInstancesPolicy=""))
+          == [("Warning", "no-time-limit")],
+          "a live read that reports an empty policy gets the default policy too")
+    check(effective_setting(with_settings(), "ExecutionTimeLimit") == "pt72h"
+          and effective_setting(job(), "Priority") == "7"
+          and effective_setting(with_settings(Priority="3"), "Priority") == "3",
+          "an absent setting takes the documented default, 72 hours for the time limit")
+    check([f["check"] for f in lint_task(with_settings(RunOnlyIfIdle="True"))]
+          == ["run-conditions"]
+          and "the computer is idle:" in lint_task(with_settings(RunOnlyIfIdle="True"))[0][
+              "detail"]
+          and "a network is available:" in lint_task(with_settings(
+              RunOnlyIfNetworkAvailable="true"))[0]["detail"]
+          and "the computer is idle and a network is available:" in lint_task(with_settings(
+              RunOnlyIfIdle="true", RunOnlyIfNetworkAvailable="true"))[0]["detail"],
+          "a task set to run only when idle or only with a network is a Warning, both are named")
+    check(check_names(with_settings(RunOnlyIfIdle="False", RunOnlyIfNetworkAvailable="false"))
+          == [], "the same settings switched off are no finding")
+
+    def ending(*ends, enabled=True):
+        return dict(job(), trigger_details=[{"kind": "Daily", "enabled": enabled,
+                                             "end_boundary": end} for end in ends])
+
+    expired = lint_task(ending("2026-06-01T00:00:00"), now=now)
+    check([(f["severity"], f["check"]) for f in expired] == [("Warning", "trigger-expired")]
+          and "2026-06-01T00:00Z" in expired[0]["detail"] and "0x00041304" in expired[0]["detail"],
+          "a task whose every trigger has ended is a Warning that names the last end and the "
+          "result code Task Scheduler gives it  <-- pinned defect")
+    check(check_names(ending("2026-06-01T00:00:00")) == [],
+          "no clock, no expiry check: lint_task without `now` never judges a trigger")
+    check(check_names(ending("2026-07-27T13:00:00Z"), now=now) == []
+          and check_names(ending("2026-07-27T11:00:00Z"), now=now) == [("Warning",
+                                                                        "trigger-expired")],
+          "a trigger counts as ended a day after its end, because a time with no zone is local")
+    check(check_names(ending("2026-06-01T00:00:00", ""), now=now) == []
+          and check_names(ending(""), now=now) == []
+          and check_names(dict(job(), trigger_details=[]), now=now) == [],
+          "one trigger with no end keeps the task alive, and a task with no triggers is no "
+          "expiry")
+    check(check_names(dict(job(), trigger_details=[
+        {"kind": "Daily", "enabled": False, "end_boundary": "2026-06-01T00:00:00"},
+        {"kind": "Logon", "enabled": True, "end_boundary": ""}]), now=now) == []
+        and check_names(ending("2026-06-01T00:00:00", enabled=False), now=now) == [],
+        "a disabled trigger does not count either way")
+    check("2026-06-05T00:00Z" in lint_task(ending("2026-06-01T00:00:00+00:00",
+                                                  "2026-06-05T00:00:00Z"), now=now)[0]["detail"],
+          "the finding names the latest end among the triggers")
+    check(check_names(dict(job(), trigger_details={"kind": "Daily", "enabled": True,
+                                                   "end_boundary": "2026-06-01T00:00:00"}),
+                      now=now) == [("Warning", "trigger-expired")],
+          "a single trigger that ConvertTo-Json unwrapped to an object is still judged")
+    ended_xml = parse_task_xml(task_xml(
+        trigger="<TimeTrigger><StartBoundary>2026-01-01T02:00:00</StartBoundary><EndBoundary>"
+                "2026-02-01T02:00:00</EndBoundary></TimeTrigger>"))
+    check([row["check"] for row in lint_rows(ended_xml, now=now)] == ["trigger-expired"]
+          and lint_rows(ended_xml) == [],
+          "an exported task is judged the same way, and only when lint_rows has a clock")
+
+    def named(name, logon, user="EXAMPLE\\svc-etl", folder="\\Jobs\\", **rest):
+        return dict(job(logon=logon, user=user, triggers="Logon"), task_name=name,
+                    task_path=folder, **rest)
+
+    trio = [named("a", "Password"), named("b", "Password"), named("c", "InteractiveToken")]
+    check(logon_minorities(trio) == {r"\Jobs\c": (
+        "logon type interactive differs from the 2 other task(s) in this folder that run as "
+        r"EXAMPLE\svc-etl, which use password: if this is not deliberate, a settings change "
+        "flipped it")},
+        "the one task whose logon type differs from two neighbours is named, with theirs")
+    flagged = lint_rows(trio)
+    check([(r["severity"], r["task"], r["check"]) for r in flagged]
+          == [("Warning", r"\Jobs\c", "logon-minority")]
+          and [r["severity"] for r in lint_rows(trio, show_ok=True)] == ["Warning", "OK", "OK"],
+          "the lint reports it as a Warning, and a task with a finding gets no OK row")
+    check(logon_minorities([named("a", "Password"), named("b", "InteractiveToken")]) == {}
+          and logon_minorities([named("a", "Password")] * 1) == {}
+          and logon_minorities([named("a", "Password"), named("b", "Password"),
+                                named("c", "Password")]) == {},
+          "two tasks differ with no majority, one task has no neighbour, and three that agree "
+          "have no outlier")
+    check(logon_minorities([named("a", "Password"), named("b", "Password"),
+                            named("c", "InteractiveToken"), named("d", "InteractiveToken")])
+          == {} and len(logon_minorities([named("a", "Password"), named("b", "Password"),
+                                          named("c", "InteractiveToken"), named("d", "S4U")]))
+          == 2,
+          "a tie names nobody, and with two outliers against a pair both are named")
+    check(logon_minorities([named("a", "Password"), named("b", "Password"),
+                            named("c", "InteractiveToken", folder="\\Other\\")]) == {}
+          and logon_minorities([named("a", "Password"), named("b", "Password"),
+                                named("c", "InteractiveToken", user="EXAMPLE\\other")]) == {},
+          "neighbours share a folder and an account")
+    check(list(logon_minorities([named("a", "Password"), named("b", "Password"),
+                                 named("c", "InteractiveToken", user="example\\SVC-ETL",
+                                       folder="\\JOBS\\")])) == [r"\JOBS\c"],
+          "folder and account are compared without regard to case")
+    check(logon_minorities(trio[:2] + [named("c", "InteractiveToken", enabled=False)]) == {}
+          and logon_minorities(trio[:2] + [named("c", "InteractiveToken", user="")]) == {}
+          and logon_minorities(trio[:2] + [named("c", "Weird")]) == {}
+          and logon_minorities(trio[:2] + [named("c", "S4U", folder="")]) == {}
+          and list(logon_minorities([named("a", "Password", folder=""),
+                                     named("b", "Password", folder=""),
+                                     named("c", "S4U", folder="")])) == ["\\c"],
+          "a disabled task, a task with no account, an unknown logon type and a task in another "
+          "folder are no outlier, and a task with no folder is in the root folder")
+
+    # --- diff: what changed between two exports of the same tasks ---
+    def parsed(**kwargs):
+        return parse_task_xml(task_xml(**kwargs))
+
+    def changes(before, after):
+        return [(r["change"], r["field"], r["old"], r["new"]) for r in diff_tasks(before, after)]
+
+    check(diff_tasks(parsed(), parsed()) == [] and diff_tasks([], []) == [],
+          "two exports of one task differ in nothing")
+    noisy = parse_task_xml(task_xml(namespace=False).replace(
+        "<RegistrationInfo>", "<RegistrationInfo><Date>2026-01-01T00:00:00</Date><Author>x"
+        "</Author><Description>d</Description>"))
+    check(diff_tasks(parsed(), noisy) == [],
+          "the namespace, the registration date, author and description are not a change")
+    check(diff_tasks(parsed(), parsed(
+        settings="<MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>"
+                 "<DisallowStartIfOnBatteries>True</DisallowStartIfOnBatteries>"
+                 "<Priority>7</Priority>", limit="PT72H")) == [],
+          "a setting written out at its default, in any case, equals one left out  "
+          "<-- pinned defect")
+    check(diff_tasks(parsed(logon="Interactive", user="EXAMPLE\\SVC-ETL"),
+                     parsed(logon="InteractiveToken")) == []
+          and diff_tasks(parsed(logon="InteractiveTokenOrPassword"), parsed(logon="Password"))
+          == [], "both spellings of a logon type, and an account in another case, are no change")
+    task_name = r"\Jobs\refresh"
+    check(diff_tasks(parsed(limit="PT1H"), parsed(limit="PT0S")) == [
+        {"change": "changed", "task": task_name, "field": "setting ExecutionTimeLimit",
+         "old": "PT1H", "new": "PT0S"}],
+        "a changed setting is one row that names the field and both values")
+    check(changes(parsed(), parsed(limit="PT0S")) == [
+        ("changed", "setting ExecutionTimeLimit", "PT72H", "PT0S")]
+        and changes(parsed(enabled="false"), parsed()) == [("changed", "enabled", "false", "true")],
+        "a setting one export leaves out is shown at its default, and Enabled has its own name")
+    check(changes(parsed(), parsed(logon="InteractiveToken")) == [
+        ("changed", "logon type", "Password", "InteractiveToken")]
+        and changes(parsed(), parsed(user="EXAMPLE\\svc-other")) == [
+            ("changed", "run as", "EXAMPLE\\svc-etl", "EXAMPLE\\svc-other")],
+        "a changed logon type or account is named, as the disaster in the README needs")
+    check(changes(parsed(), parse_task_xml(task_xml().replace(
+        "</Principal>", "<RunLevel>HighestAvailable</RunLevel></Principal>")))
+        == [("changed", "run level", "", "HighestAvailable")],
+        "a changed run level is named; an absent one has no documented default, so it shows "
+        "as blank")
+    daily_2 = ("<CalendarTrigger><StartBoundary>2026-01-01T02:00:00</StartBoundary>"
+               "<ScheduleByDay><DaysInterval>1</DaysInterval></ScheduleByDay></CalendarTrigger>")
+    daily_3 = daily_2.replace("02:00", "03:00")
+    moved = changes(parsed(trigger=daily_2), parsed(trigger=daily_3))
+    check(len(moved) == 1 and moved[0][:2] == ("changed", "trigger")
+          and "StartBoundary=2026-01-01T02:00:00" in moved[0][2]
+          and "StartBoundary=2026-01-01T03:00:00" in moved[0][3]
+          and moved[0][2].startswith("Daily Enabled=true,"),
+          "a moved trigger is one row with the old and the new schedule")
+    boot = "<BootTrigger><Delay>PT1M</Delay></BootTrigger>"
+    check(diff_tasks(parsed(trigger=daily_2 + boot), parsed(trigger=boot + daily_2)) == []
+          and changes(parsed(trigger=daily_2), parsed(trigger=daily_2 + boot))
+          == [("changed", "trigger", "", "Boot Delay=PT1M, Enabled=true")]
+          and changes(parsed(trigger=daily_2 + boot), parsed(trigger=daily_2))
+          == [("changed", "trigger", "Boot Delay=PT1M, Enabled=true", "")],
+          "triggers are compared in any order, and an added or removed one is a row with a "
+          "blank side")
+    check(len(changes(parsed(trigger=boot), parsed(trigger=boot.replace(
+        "<Delay>", "<Enabled>false</Enabled><Delay>")))) == 1,
+        "a trigger that is switched off differs from one that is on")
+    check(diff_tasks(parsed(trigger=boot + boot), parsed(trigger=boot)) != []
+          and unmatched([("a", "A"), ("a", "A")], [("a", "A")]) == [("A", "")]
+          and unmatched([], [("b", "B")]) == [("", "B")],
+          "a trigger repeated twice is not matched by one")
+    month = ("<CalendarTrigger><ScheduleByMonth><DaysOfMonth><Day>%d</Day><Day>28</Day>"
+             "</DaysOfMonth><Months><January/></Months></ScheduleByMonth></CalendarTrigger>")
+    weeks = ("<CalendarTrigger><ScheduleByMonthDayOfWeek><Weeks><Week>%s</Week><Week>4</Week>"
+             "</Weeks><DaysOfWeek><Monday/></DaysOfWeek><Months><January/></Months>"
+             "</ScheduleByMonthDayOfWeek></CalendarTrigger>")
+    check(len(changes(parsed(trigger=month % 10), parsed(trigger=month % 15))) == 1
+          and changes(parsed(trigger=month % 10), parsed(trigger=month % 10)) == []
+          and len(changes(parsed(trigger=weeks % "1"), parsed(trigger=weeks % "2"))) == 1
+          and "Day=10, ScheduleByMonth.DaysOfMonth.Day=28" in changes(
+              parsed(trigger=month % 10), parsed(trigger=month % 15))[0][2],
+          "a monthly trigger that moves one of its repeated Day or Week values is a change; "
+          "the last value kept used to hide it  <-- pinned defect")
+    check(parse_dt("9999-12-31T23:59:59-05:00") is None
+          and parse_dt("9999-12-31T23:59:59Z") == datetime(9999, 12, 31, 23, 59, 59,
+                                                            tzinfo=timezone.utc),
+          "a timestamp past the last UTC instant is None, not an OverflowError  "
+          "<-- pinned defect")
+    check(changes(parsed(), parsed(command=r"C:\Python311\python.exe")) == [
+        ("changed", "action 1", r"Exec C:\Python39\python.exe C:\jobs\refresh.py [Start In "
+         r"C:\jobs]", r"Exec C:\Python311\python.exe C:\jobs\refresh.py [Start In C:\jobs]")]
+        and changes(parsed(), parsed(arguments=r"C:\jobs\refresh.py --days 30"))[0][3].endswith(
+            r"refresh.py --days 30 [Start In C:\jobs]")
+        and changes(parsed(start="C:\\jobs"), parsed(start="C:\\JOBS")) == [],
+        "a changed program or argument is one row for that action, and a Start In in another "
+        "case is no change")
+    two = parse_task_xml(task_xml().replace(
+        "</Exec></Actions>", "</Exec><Exec><Command>C:\\jobs\\after.bat</Command></Exec>"
+                             "</Actions>"))
+    check(changes(parsed(), two) == [("changed", "action 2", "", "Exec C:\\jobs\\after.bat")]
+          and changes(two, parsed()) == [("changed", "action 2", "Exec C:\\jobs\\after.bat",
+                                          "")],
+          "an added or removed action is a row with a blank side, and a bare action has no "
+          "Start In")
+    handler = task_xml().replace("</Actions>", "<ComHandler><ClassId>{abc}</ClassId><Data>one"
+                                               "</Data></ComHandler></Actions>")
+    check(changes(parse_task_xml(handler), parse_task_xml(handler.replace("one", "two")))
+          == [("changed", "action 2", "ComHandler {abc}",
+               "ComHandler {abc} (a value changed that is not printed)")]
+          and changes(parse_task_xml(handler), parse_task_xml(handler.replace(
+              "<ClassId>{abc}</ClassId>", ""))) != []
+          and describe_action({"kind": "ComHandler", "leaves": []}) == (("ComHandler", ()),
+                                                                          "ComHandler"),
+          "a COM handler is compared by every field and shown by its class id only")
+    check(changes([], parsed()) == [("added", "", "", "")]
+          and changes(parsed(), []) == [("removed", "", "", "")]
+          and diff_tasks(parsed(uri="\\jobs\\REFRESH"), parsed()) == [],
+          "a task in one export only is added or removed, and names match without regard to "
+          "case")
+    renamed = diff_tasks(parsed(uri="\\Jobs\\b"), parsed(uri="\\Jobs\\a"))
+    check([(r["change"], r["task"]) for r in renamed] == [("added", r"\Jobs\a"),
+                                                          ("removed", r"\Jobs\b")],
+          "a rename is an added and a removed task, in name order")
+
+    arcgis = r"C:\Program Files\ArcGIS\Pro\bin\Python\envs\arcgispro-py3\python.exe"
+    flipped_arc = changes(parsed(command=arcgis), parsed(command=arcgis, logon="InteractiveToken"))
+    check([row[1] for row in flipped_arc] == ["logon type", "arcpy-licence"]
+          and "NotInitialized" in flipped_arc[1][3] and flipped_arc[1][3] == LICENCE_NOTE
+          and len(LICENCE_NOTE) < 240,
+          "a logon change on a task that runs ArcGIS Pro's Python also names the licence "
+          "conditions  <-- pinned defect")
+    check([row[1] for row in changes(parsed(command="cmd.exe", arguments='/c "C:\\Program Files'
+                                           '\\ArcGIS\\Pro\\bin\\Python\\Scripts\\propy.bat" x.py'),
+                                     parsed(command="cmd.exe", arguments='/c "C:\\Program Files'
+                                            '\\ArcGIS\\Pro\\bin\\Python\\Scripts\\propy.bat" x.py',
+                                            user="EXAMPLE\\other"))]
+          == ["run as", "arcpy-licence"]
+          and [row[1] for row in changes(parsed(arguments="-m arcgispro-py3"), parsed(
+              arguments="-m arcgispro-py3", user="EXAMPLE\\other"))] == ["run as", "arcpy-licence"]
+          and "arcpy-licence" in [row[1] for row in changes(
+              parsed(command=arcgis), parse_task_xml(task_xml(command=arcgis).replace(
+                  "</Principal>", "<RunLevel>HighestAvailable</RunLevel></Principal>")))],
+          "propy, the arcgispro-py3 environment and a run level change all count")
+    check([row[1] for row in changes(parsed(), parsed(logon="InteractiveToken"))]
+          == ["logon type"]
+          and changes(parsed(command=arcgis), parsed(command=arcgis, limit="PT0S"))
+          == [("changed", "setting ExecutionTimeLimit", "PT72H", "PT0S")],
+          "no licence note for another program, or for an ArcGIS task whose account and logon "
+          "did not change")
+
+    secret_line = ("-password Hunter2 --token=abc123 /pw:Secret9 -apikey QUJD+RA== data.csv "
+                   "-x 5")
+    check(mask_arguments(secret_line) == "-password *** --token=*** /pw:*** -apikey *** "
+          "data.csv -x 5", "the value of every secret switch is masked, and nothing else")
+    check(mask_arguments(r'/c "set PGPASSWORD=Hunter2&& C:\jobs\run.bat"')
+          == r'/c "set *** C:\jobs\run.bat"'
+          and mask_arguments("--out=r.csv -Name=foo+bar //host/share /var/log")
+          == "--out=r.csv -Name=*** //host/share /var/log"
+          and mask_arguments(r'"C:\Program Files\x\y.exe"') == r'"C:\Program Files\x\y.exe"'
+          and mask_arguments("") == "",
+          "a secret in a cmd /c body is masked word by word, a base64-looking value is masked, "
+          "and a path, a share and a plain switch are left alone")
+    check(mask_arguments("https://svc:Hunter2@host/api --url=ftp://a:Pw9@h/")
+          == "https://svc:***@host/api --url=ftp://a:***@h/"
+          and mask_arguments("https://host/api@c") == "https://host/api@c",
+          "the password in a URL is masked, wherever the URL sits, and a URL with no password is "
+          "not touched  <-- pinned defect")
+    check(mask_arguments(r"use \\srv\share Pa55word", "net") == "***"
+          and mask_arguments("", "net") == "",
+          "every argument of net is masked: it takes its password by position")
+    check(mask_arguments("-S srv -U sa -P Hunter2x") == "-S srv -U sa -P ***"
+          and mask_arguments("-p Hunter2y -x 5") == "-p *** -x 5"
+          and mask_arguments("--auth Bearer_abc --author bob") == "--auth *** --author bob"
+          and mask_arguments("-S srv -U sa") == "-S srv -U sa",
+          "the value of -P, -p and --auth is masked, and --author and other letters are not  "
+          "<-- pinned defect")
+
+    def secretive(args, command="C:\\jobs\\tool.exe"):
+        return changes(parsed(command=command, arguments=args[0]),
+                       parsed(command=command, arguments=args[1]))
+
+    shown = []
+    for pair_of_args, command in (
+            ((secret_line, secret_line.replace("Hunter2", "Hunter3")), "C:\\jobs\\tool.exe"),
+            ((r"use \\srv\share Pa55word", r"use \\srv\share Pa66word"), "net.exe"),
+            ((r'/c "set PGPASSWORD=Hunter2&amp;&amp; C:\jobs\run.bat"',
+              r'/c "set PGPASSWORD=Hunter3&amp;&amp; C:\jobs\run.bat"'), "cmd.exe"),
+            (("--password Hunter2", "--password Hunter3"), "C:\\jobs\\sync.exe --apikey QUJD+RA=="),
+            (("-S srv -U sa -P Hunter2x", "-S srv -U sa -P Hunter3x"), "sqlcmd.exe"),
+            (("-p Hunter2y", "-p Hunter3y"), "mysql.exe"),
+            (("--auth Bearer_abc123tok", "--auth Bearer_abc124tok"), "C:\\jobs\\sync.exe")):
+        rows = secretive(pair_of_args, command)
+        shown.append(rows)
+        for fmt in ("table", "csv", "json"):
+            out = io.StringIO()
+            write_output(diff_tasks(parsed(command=command, arguments=pair_of_args[0]),
+                                    parsed(command=command, arguments=pair_of_args[1])),
+                         fmt, out, diff=True)
+            leaked = [word for word in ("Hunter2", "Hunter3", "abc123", "abc124", "Secret9", "QUJD",
+                                        "Pa55word", "Pa66word", "PGPASSWORD=Hunter")
+                      if word in out.getvalue()]
+            check(not leaked, "no secret reaches the %s diff of command line %d  "
+                  "<-- pinned defect" % (fmt, len(shown)))
+    check(all(len(rows) == 1 and rows[0][3].endswith("(a value changed that is not printed)")
+              for rows in shown),
+          "a change to a secret is reported as a change, with the value left out  "
+          "<-- pinned defect")
+
+    diff_out = io.StringIO()
+    write_output(diff_tasks(parsed(limit="PT1H"), parsed(limit="PT0S")), "table", diff_out,
+                 diff=True)
+    check(diff_out.getvalue().startswith("CHANGE") and "setting ExecutionTimeLimit"
+          in diff_out.getvalue(), "the diff table has its own columns")
+    empty_diff = io.StringIO()
+    write_output([], "table", empty_diff, diff=True)
+    check(empty_diff.getvalue() == "No differences.\n", "an empty diff says so")
+    diff_csv = io.StringIO()
+    write_output(diff_tasks(parsed(command="C:\\jobs\\a.exe"), parsed(command="C:\\jobs\\b.exe")),
+                 "csv", diff_csv, diff=True)
+    cells = next(csv.DictReader(io.StringIO(diff_csv.getvalue())))
+    check(diff_csv.getvalue().splitlines()[0] == "change,task,field,old,new"
+          and cells["field"] == "action 1" and cells["new"].startswith("Exec C:\\jobs\\b.exe"),
+          "the diff csv has its own header")
+    formula = io.StringIO()
+    write_output([{"change": "changed", "task": "=x", "field": "f", "old": "-1", "new": "@y"}],
+                 "csv", formula, diff=True)
+    cells = next(csv.DictReader(io.StringIO(formula.getvalue())))
+    check(cells["task"] == "'=x" and cells["old"] == "'-1" and cells["new"] == "'@y",
+          "a diff cell a spreadsheet would run as a formula is written as text")
+
+    # --- the live read asks for what the lint judges ---
+    live_script = []
+    module["run_powershell"] = lambda script, timeout, what: live_script.append(script) or []
+    try:
+        read_tasks()
+    finally:
+        module["run_powershell"] = real_bridge
+    check("MultipleInstancesPolicy   = [string]$task.Settings.MultipleInstances" in live_script[0]
+          and "ExecutionTimeLimit        = [string]$task.Settings.ExecutionTimeLimit"
+          in live_script[0] and "RunOnlyIfIdle             = [string]$task.Settings.RunOnlyIfIdle"
+          in live_script[0] and "end_boundary = [string]$g.EndBoundary" in live_script[0]
+          and 'catch { $failed += "settings" }' in live_script[0]
+          and "trigger_details       = $triggerDetails" in live_script[0]
+          and "settings              = $settings" in live_script[0],
+          "the live query asks for the policy, the time limit, the idle and network conditions "
+          "and each trigger's end, under the schema's names, and names a settings read that "
+          "failed")
 
     # --- files and folders, then the command line end to end ---
     scratch = tempfile.mkdtemp(prefix="taskpulse-selftest-")
@@ -3019,6 +4164,60 @@ def self_test():
             code, out, err = cli("--history", "--since-record-id", "500", "--match", "etl")
             check(code == 0 and "2 of 3 run(s) since record 500 failed" in out,
                   "a watermark run says its columns start at the watermark  <-- pinned defect")
+            # --- run fate, end to end through the command line ---
+            module["read_tasks"] = lambda timeout=120: [dict(t, state="Running") for t in live]
+            module["read_run_events"] = serve([ago(40, 100, "hung", 2000),
+                                               ago(39, 200, "hung", 2001)])
+            code, out, err = cli("--history", "--match", "etl", "--format", "json")
+            hung_row = json.loads(out)[0]
+            check(code == 0 and hung_row["fate"] == "STUCK" and hung_row["status"] == "Warning"
+                  and "STUCK: a run started 40.0 hour(s) ago has not finished"
+                  in hung_row["reason"] and hung_row["blocked_launches_last_7_days"] == 0
+                  and "read 2 run event(s)" in err,
+                  "a run with no end event for 40 hours on a Running task is a STUCK Warning in "
+                  "the default report, and a Warning never makes the exit code non-zero")
+            code, out, err = cli("--history", "--match", "etl")
+            check("STUCK" in out and out.startswith("STATUS"),
+                  "the STUCK reason reaches the table too")
+            code, out, err = cli("--history", "--match", "etl", "--stuck-hours", "48",
+                                 "--show-ok", "--format", "json")
+            check(json.loads(out)[0]["fate"] == "",
+                  "--stuck-hours 48 leaves a 40-hour run alone")
+            module["read_tasks"] = lambda timeout=120: [dict(t) for t in live]
+            code, out, err = cli("--history", "--match", "etl", "--show-ok", "--format", "json")
+            check(json.loads(out)[0]["fate"] == "" and json.loads(out)[0]["status"] == "Success",
+                  "the same events on a task whose state is Ready are a lost end event, not a "
+                  "stuck run  <-- pinned defect")
+            bad_flags = [cli("--stuck-hours", "5")[0], cli("--history", "--stuck-hours", "0")[0],
+                       cli("--history", "--stuck-hours", "x")[0], cli("--stuck-h", "5",
+                                                                    "--history")[0]]
+            code, out, err = cli("--stuck-hours", "5")
+            check(bad_flags == [64] * 4 and "needs --history" in err
+                  and "must be 1 or more" in cli("--history", "--stuck-hours", "0")[2],
+                  "--stuck-hours without --history, below 1, not a number, or typed as a "
+                  "prefix is a usage error  <-- pinned defect")
+            module["read_run_events"] = serve([
+                ago(30, 100, "late", 2998), ago(29, 102, "late", 2999),
+                {"event_id": 332, "instance_id": "", "task_full_name": r"\Jobs\etl",
+                 "event_record_id": 3000, "result_code": None,
+                 "event_time_utc": (clock - timedelta(hours=5)).isoformat()}])
+            code, out, err = cli("--history", "--match", "etl", "--format", "json")
+            blocked_row = json.loads(out)[0]
+            check(code == 0 and blocked_row["fate"] == "BLOCKED"
+                  and blocked_row["blocked_launches_last_7_days"] == 1
+                  and "event 332" in blocked_row["reason"] and "read 3 run event(s)" in err,
+                  "a launch refused after the task's last run leaves it BLOCKED, and the report "
+                  "counts the refusal")
+            code, out, err = cli("--history", "--match", "etl")
+            check("BLOCKED" in out, "BLOCKED shows in the table")
+            code, out, err = cli("--history", "--show-ok", "--format", "csv", "--match", "etl")
+            cells = list(csv.DictReader(io.StringIO(out)))[0]
+            check(cells["fate"] == "BLOCKED" and cells["blocked_launches_last_7_days"] == "1",
+                  "the CSV carries the fate columns")
+            code, out, err = cli("--show-ok", "--format", "json", "--match", "etl")
+            check(json.loads(out)[0]["fate"] == "",
+                  "without --history there is no fate to report")
+
             module["read_run_events"] = real_readers[1]
             refused = read_error("System.UnauthorizedAccessException,Microsoft.PowerShell."
                                  "Commands.GetWinEventCommand",
@@ -3200,6 +4399,108 @@ def self_test():
             code, out, err = cli("--lint", "--history")
             check(code == 64 and "not allowed with" in err,
                   "--lint and --history are refused together as a usage error")
+            # --- --diff, end to end ---
+            old_export = os.path.join(scratch, "old.xml")
+            new_export = os.path.join(scratch, "new.xml")
+            with open(old_export, "wb") as handle:
+                handle.write(task_xml(uri="\\Jobs\\nightly", limit="PT1H").encode("utf-16"))
+            with open(new_export, "wb") as handle:
+                handle.write(task_xml(uri="\\Jobs\\nightly", limit="PT0S",
+                                      logon="InteractiveToken").encode("utf-8"))
+            code, out, err = cli("--diff", old_export, new_export)
+            check(code == 2 and out.startswith("CHANGE") and "setting ExecutionTimeLimit" in out
+                  and "logon type" in out and r"\Jobs\nightly" in out and err == "",
+                  "--diff names each field that changed between two exports and exits 2")
+            code, out, err = cli("--diff", old_export, old_export)
+            check(code == 0 and out == "No differences.\n",
+                  "--diff of an export with itself says so and exits 0")
+            code, out, err = cli("--diff", old_export, new_export, "--format", "json",
+                                 "--match", "nightly")
+            check(code == 2 and {row["field"] for row in json.loads(out)}
+                  == {"setting ExecutionTimeLimit", "logon type"},
+                  "--diff writes json, and --match scopes it")
+            code, out, err = cli("--diff", old_export, new_export, "--match", "nothing")
+            check(code == 0 and out == "No differences.\n",
+                  "--match that keeps no row is a clean diff")
+            code, out, err = cli("--diff", os.path.join(scratch, "Tasks"), loose)
+            check(code == 2 and "removed" in out and "added" in out and r"\export" in out
+                  and r"\Jobs\nightly" in out,
+                  "--diff reads a folder as it reads a file, and a task in one side is added or "
+                  "removed")
+            stock_old = os.path.join(scratch, "stock-old.xml")
+            stock_new = os.path.join(scratch, "stock-new.xml")
+            for stock_path, stock_limit in ((stock_old, "PT1H"), (stock_new, "PT0S")):
+                with open(stock_path, "wb") as handle:
+                    handle.write(task_xml(uri="\\Microsoft\\Windows\\X\\stock",
+                                          limit=stock_limit).encode("utf-8"))
+            code, out, err = cli("--diff", stock_old, stock_new)
+            code_all, out_all, err_all = cli("--diff", stock_old, stock_new, "--all")
+            check(code == 1 and out == "" and "2 task(s)" in err and "pass --all" in err
+                  and "no result" in err and code_all == 2 and "stock" in out_all
+                  and "not examined" not in err_all,
+                  "--diff of two exports that hold only Microsoft's own tasks has no result: "
+                  "exit 1 and a notice, never 'No differences'  <-- pinned defect")
+            mixed = {}
+            for side, stock_path in (("a", stock_old), ("b", stock_new)):
+                mixed[side] = os.path.join(scratch, "mixed-" + side)
+                os.makedirs(mixed[side])
+                with open(os.path.join(mixed[side], "own.xml"), "wb") as handle:
+                    handle.write(task_xml(uri="\\Jobs\\own").encode("utf-8"))
+                shutil.copy(stock_path, os.path.join(mixed[side], "stock.xml"))
+            code, out, err = cli("--diff", mixed["a"], mixed["b"])
+            check(code == 0 and out == "No differences.\n" and "2 task(s)" in err
+                  and "no result" not in err,
+                  "--diff that skipped some of Microsoft's tasks says so on stderr and still "
+                  "compares the rest  <-- pinned defect")
+            code, out, err = cli("--lint", stock_old)
+            code_all, out_all, err_all = cli("--lint", stock_old, "--all")
+            code_mixed, out_mixed, err_mixed = cli("--lint", mixed["a"], "--show-ok")
+            check(code == 1 and out == "" and "1 task(s)" in err and "no result" in err
+                  and "not examined" not in err_all and "not examined" in err_mixed
+                  and "no result" not in err_mixed and code_mixed == 0,
+                  "--lint of an export that holds only Microsoft's own tasks has no result: "
+                  "exit 1 and a notice, never 'No findings'  <-- pinned defect")
+            diff_target = os.path.join(scratch, "diff.json")
+            code, out, err = cli("--diff", old_export, new_export, "--format", "json", "--out",
+                                 diff_target)
+            check(code == 2 and not os.path.exists(diff_target) and "was not written" in err,
+                  "--diff with --out and no --apply writes nothing")
+            code, out, err = cli("--diff", old_export, new_export, "--format", "json", "--out",
+                                 diff_target, "--apply")
+            with open(diff_target) as handle:
+                saved_diff = json.load(handle)
+            check(code == 2 and out == "" and len(saved_diff) == 2 and "wrote 2 row(s)" in err,
+                  "--diff --out --apply writes the rows and still exits 2")
+            code, out, err = cli("--diff", old_export, new_export, "--out",
+                                 os.path.join(scratch, "nope", "x.json"), "--apply")
+            check(code == 1 and "cannot write" in err,
+                  "--diff with an --out it cannot write exits 1, not 2")
+            with open(old_export, "rb") as handle:
+                before_bytes = handle.read()
+            outcomes = [cli("--diff", old_export, new_export, "--out", path, "--apply")
+                        for path in (old_export, new_export)]
+            with open(old_export, "rb") as handle:
+                kept_old = handle.read() == before_bytes
+            check([code for code, _, _ in outcomes] == [64, 64] and kept_old
+                  and all("this run lints or compares" in err for _, _, err in outcomes),
+                  "--out on an export that --diff compares is refused and the export is "
+                  "untouched  <-- pinned defect")
+            code, out, err = cli("--diff", old_export, os.path.join(scratch, "missing.xml"))
+            check(code == 1 and "missing.xml" in err and out == "",
+                  "--diff of a missing export exits 1 and names it")
+            code, out, err = cli("--diff", broken, old_export)
+            check(code == 1 and "broken.xml" in err and "no <Task> element found" in err,
+                  "--diff of a file with no task in it exits 1, not 'No differences'  "
+                  "<-- pinned defect")
+            refused = [cli(*argv)[0] for argv in (("--diff", old_export), ("--diff",),
+                                                  ("--diff", old_export, new_export, "--lint"),
+                                                  ("--diff", old_export, new_export,
+                                                   "--history"),
+                                                  ("--dif", old_export, new_export))]
+            check(refused == [64] * 5,
+                  "--diff takes exactly two paths, cannot be combined with --lint or "
+                  "--history, and cannot be typed as a prefix  <-- pinned defect")
+
             usage = [cli(*argv)[0] for argv in (("--bogus",), ("--timeout", "abc"),
                                                 ("--format", "xml"), ("--history", "x"))]
             check(usage == [64] * 4,
@@ -3249,6 +4550,47 @@ def self_test():
             module["read_tasks"] = lambda timeout=120: [dict(unread, enabled=False)]
             check(cli("--show-ok")[0] == 0,
                   "a disabled task whose run details could not be read is not a blind spot")
+            # The stub behind the README's run-fate example. Hours are counted back from one
+            # clock, so the "40.0 hour(s)" in the README is the value this run prints.
+            clock = datetime.now(timezone.utc)
+            folder = "\\GIS\\"
+
+            def aged(hours, event_id, instance, record, name, code=None):
+                return {"event_id": event_id, "instance_id": instance, "event_record_id": record,
+                        "task_full_name": folder + name, "result_code": code,
+                        "event_time_utc": (clock - timedelta(hours=hours)).isoformat()}
+
+            def sample(name, state, result=0):
+                return dict(later, task_path=folder, task_name=name, state=state,
+                            last_task_result=result, last_run_time=None, actions=[],
+                            next_run_time="2999-01-01T02:00:00+00:00", read_errors="")
+
+            module["read_tasks"] = lambda timeout=120: [
+                sample("nightly-parcel-refresh", "Running"), sample("report-mailer", "Running"),
+                sample("tile-cache", "Ready"), sample("locator-rebuild", "Ready", 0x8007052E)]
+            module["read_run_events"] = serve([
+                aged(40, 100, "a", 1, "nightly-parcel-refresh"),
+                aged(40, 200, "a", 2, "nightly-parcel-refresh"),
+                aged(50, 100, "b", 3, "report-mailer"), aged(50, 200, "b", 4, "report-mailer"),
+                aged(26, 322, "b", 5, "report-mailer"), aged(2, 322, "b", 6, "report-mailer"),
+                aged(30, 100, "c", 7, "tile-cache"), aged(30, 200, "c", 8, "tile-cache"),
+                aged(29.9, 201, "c", 9, "tile-cache", 0), aged(29.9, 102, "c", 10, "tile-cache"),
+                aged(5, 332, "", 11, "tile-cache"),
+                aged(20, 100, "d", 12, "locator-rebuild"),
+                aged(20, 201, "d", 23, "locator-rebuild", 0x8007052E)])
+            code, out, err = cli("--history")
+            cells = [re.split(r"  +", line) for line in out.splitlines()[2:]]
+            check(code == 2 and "read 13 run event(s)" in err and len(cells) == 4
+                  and [(row[0], row[1]) for row in cells] == [
+                      ("Error", folder + "locator-rebuild"),
+                      ("Warning", folder + "nightly-parcel-refresh"),
+                      ("Warning", folder + "report-mailer"), ("Warning", folder + "tile-cache")]
+                  and "; 1 of 1 run(s)" in cells[0][-1]
+                  and cells[1][-1] == "STUCK: a run started 40.0 hour(s) ago has not finished; task"
+                  and cells[2][-1] == "STUCK: a run started 50.0 hour(s) ago has not finished; 2 la"
+                  and cells[3][-1] == "BLOCKED: the latest launch was refused because the run-as us",
+                  "the run-fate example in the README: two STUCK, one BLOCKED and one Error "
+                  "row, exit 2, with the rows the README prints")
             module["read_tasks"] = unavailable
             code, out, err = cli()
             check(code == 1 and "not reachable" in err, "a failed inventory read exits 1")
@@ -3329,6 +4671,44 @@ class Parser(argparse.ArgumentParser):
         self.exit(USAGE_ERROR, "%s: error: %s\n" % (self.prog, message))
 
 
+def emit(rows, args, lint=False, diff=False):
+    """Print the report, or with --apply write it to --out. 1 when the write failed, else 0."""
+    report = io.StringIO()
+    write_output(rows, args.format, report, lint, diff)
+    if args.apply:
+        try:
+            with open(args.out, "w", encoding="utf-8", newline="") as handle:
+                handle.write(report.getvalue())
+        except OSError as error:
+            sys.stderr.write("taskpulse: cannot write %s: %s\n" % (args.out, error))
+            return 1
+        sys.stderr.write("taskpulse: wrote %d row(s) to %s\n" % (len(rows), args.out))
+    else:
+        # A redirected Windows console encodes as cp1252; a task named in another script
+        # would raise there and lose every finding. Print what cannot be encoded as \uXXXX.
+        encoding = getattr(sys.stdout, "encoding", None) or "utf-8"
+        sys.stdout.write(report.getvalue().encode(encoding, "backslashreplace").decode(encoding))
+        if args.out:
+            sys.stderr.write("taskpulse: check only, %s was not written; re-run with --apply\n"
+                             % args.out)
+    return 0
+
+
+def skip_notice(skipped, sides):
+    r"""Say on stderr that --all would add tasks. True when no task was left to examine.
+
+    Without --all, tasks under \Microsoft\ are dropped from a file or folder the user named,
+    and a result over zero tasks looks the same as a clean one, so that case is never clean.
+    """
+    if skipped:
+        sys.stderr.write("taskpulse: %d task(s) under \\Microsoft\\ were not examined; pass "
+                         "--all to include them\n" % skipped)
+    if skipped and not any(sides):
+        sys.stderr.write("taskpulse: no other task was left to examine, so there is no result\n")
+        return True
+    return False
+
+
 def main(argv=None):
     parser = Parser(
         prog="taskpulse",
@@ -3355,12 +4735,17 @@ def main(argv=None):
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--history", nargs="?", type=int, const=30, metavar="DAYS",
                       help="also read the Task Scheduler Operational log and report each "
-                           "task's last 7 days of runs and its duration baseline "
+                           "task's last 7 days of runs, its duration baseline, and whether it "
+                           "is STUCK or BLOCKED "
                            "(default: 30 days of events, newest first; at least 7)")
     mode.add_argument("--lint", nargs="*", metavar="PATH",
                       help="report configuration findings instead of run health. With no "
                            "PATH, lint the live Task Scheduler; with PATHs, lint exported task "
                            "XML files or folders (works on any OS)")
+    mode.add_argument("--diff", nargs=2, metavar=("OLD", "NEW"),
+                      help="compare two exports of the same tasks (files or folders, any OS) "
+                           "and name each field that changed. Exits 0 when they match, 2 "
+                           "when they differ")
     parser.add_argument("--local-drives", default="C", metavar="LETTERS",
                         help="with --lint, drive letters that are local disks, not mapped "
                              "drives (default: C)")
@@ -3369,6 +4754,9 @@ def main(argv=None):
                              "first. Pass the watermark the previous run printed, even 0. The "
                              "day window is ignored, and the run columns count only the runs "
                              "since ID")
+    parser.add_argument("--stuck-hours", type=int, metavar="HOURS",
+                        help="with --history, a run with no end event after this many hours is "
+                             "STUCK (default: %d)" % STUCK_HOURS)
     parser.add_argument("--timeout", type=int, default=120, metavar="SECONDS",
                         help="Task Scheduler query timeout (default: 120)")
     parser.add_argument("--self-test", action="store_true",
@@ -3390,25 +4778,47 @@ def main(argv=None):
     if (args.since_record_id or 0) < 0:
         parser.error("--since-record-id must be 0 or more")
     since = args.since_record_id  # None is a cold start; 0, as an empty log prints, is not
-    if args.out and args.lint and any(inside(args.out, path) for path in args.lint):
-        # One mistyped path would replace the export being linted with its own findings.
-        parser.error("--out %s is an export this run lints, or inside one" % args.out)
+    if args.stuck_hours is not None and args.history is None:
+        parser.error("--stuck-hours needs --history")
+    if args.stuck_hours is not None and args.stuck_hours < 1:
+        parser.error("--stuck-hours must be 1 or more")
+    stuck_hours = args.stuck_hours or STUCK_HOURS
+    if args.out and any(inside(args.out, path) for path in (args.lint or []) + (args.diff or [])):
+        # One mistyped path would replace the export being read with the report on it.
+        parser.error("--out %s is an export this run lints or compares, or inside one" % args.out)
 
     if args.self_test:
         return self_test()
 
     lint = args.lint is not None
+    diff = args.diff is not None
     try:
-        tasks = read_task_files(args.lint) if args.lint else read_tasks(args.timeout)
+        if diff:
+            before, after = [read_task_files([path]) for path in args.diff]
+        else:
+            tasks = read_task_files(args.lint) if args.lint else read_tasks(args.timeout)
     except Exception as error:
         sys.stderr.write("taskpulse: %s\n" % error)
         return 1
 
-    if not args.all:
-        tasks = [task for task in tasks if not is_microsoft_task(task)]
-
     now = datetime.now(timezone.utc)
-    run_summary = {}
+    if diff:
+        sides = [[task for task in side if args.all or not is_microsoft_task(task)]
+                 for side in (before, after)]
+        if skip_notice(len(before) + len(after) - len(sides[0]) - len(sides[1]), sides):
+            return 1
+        rows = diff_tasks(*sides)
+        rows = [row for row in rows if pattern.search(row["task"])]
+        return emit(rows, args, diff=True) or (2 if rows else 0)
+
+    if not args.all:
+        kept = [task for task in tasks if not is_microsoft_task(task)]
+        # Only for tasks the user named by path: a silent filter there reads as a clean file.
+        if args.lint and skip_notice(len(tasks) - len(kept), [kept]):
+            return 1
+        tasks = kept
+
+    run_summary, fates = {}, {}
     incomplete = False
     history = "off"
     if args.history is not None:
@@ -3427,7 +4837,10 @@ def main(argv=None):
             # oldest past a watermark, the newest on a cold start.
             capped = len(events) > HISTORY_MAX_EVENTS
             events = events[:HISTORY_MAX_EVENTS]
-            run_summary = summarize_runs(build_run_rows(events, tasks), now, since)
+            runs = build_run_rows(events, tasks)
+            run_summary = summarize_runs(runs, now, since)
+            fates = judge_fates(runs, build_block_rows(events, tasks), tasks, now, since,
+                                stuck_hours)
             # Report the watermark over every event fetched, not only the ones that joined to
             # a task: an event for an unmonitored task is still an event this run has read.
             # Past a watermark the read is oldest first, so every record below the new one has
@@ -3465,10 +4878,10 @@ def main(argv=None):
             history = "incomplete" if incomplete else "complete"
 
     if lint:
-        rows = lint_rows(tasks, args.local_drives.split(","), args.show_ok)
+        rows = lint_rows(tasks, args.local_drives.split(","), args.show_ok, now)
     else:
-        rows = [evaluate(task, now, run_summary.get(full_task_name(task)), history)
-                for task in tasks]
+        rows = [evaluate(task, now, run_summary.get(full_task_name(task)), history,
+                         fates.get(full_task_name(task))) for task in tasks]
 
     rows = [row for row in rows if pattern.search(row["task"])]
     if not lint and not args.show_ok:
@@ -3479,24 +4892,8 @@ def main(argv=None):
     if not lint:
         rows.sort(key=lambda row: (row["status"] != "Error", row["task"].lower()))
 
-    report = io.StringIO()
-    write_output(rows, args.format, report, lint)
-    if args.apply:
-        try:
-            with open(args.out, "w", encoding="utf-8", newline="") as handle:
-                handle.write(report.getvalue())
-        except OSError as error:
-            sys.stderr.write("taskpulse: cannot write %s: %s\n" % (args.out, error))
-            return 1
-        sys.stderr.write("taskpulse: wrote %d row(s) to %s\n" % (len(rows), args.out))
-    else:
-        # A redirected Windows console encodes as cp1252; a task named in another script
-        # would raise there and lose every finding. Print what cannot be encoded as \uXXXX.
-        encoding = getattr(sys.stdout, "encoding", None) or "utf-8"
-        sys.stdout.write(report.getvalue().encode(encoding, "backslashreplace").decode(encoding))
-        if args.out:
-            sys.stderr.write("taskpulse: check only, %s was not written; re-run with --apply\n"
-                             % args.out)
+    if emit(rows, args, lint):
+        return 1
 
     failed = [row for row in rows if row.get("status", row.get("severity")) == "Error"]
     if failed:

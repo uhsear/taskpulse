@@ -10,3 +10,4 @@ logs/
 *.env
 credentials*
 *token*
+.coverage

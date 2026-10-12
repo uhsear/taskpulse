@@ -9,12 +9,17 @@ see its licence, and the refresh broke. Task Scheduler's `Last Run Result` did n
 cause. Until the next run, it still showed the previous night's success. The task carried a
 configuration that broke its next run, and every field anyone looked at said it was fine.
 
-taskpulse does two jobs. The health report joins the fields Task Scheduler keeps apart and
-prints one verdict per task. The lint (`--lint`) reads each task's configuration and names what
-will make the next run fail: a logon type that only runs while somebody is logged on, a
-`Start In` that is empty, quoted or relative, a share the run-as account cannot reach, a
-program that only `PATH` can find. The lint also reads exported task XML, so it runs on any OS.
-Standard library only, no install, no config file, no credentials.
+taskpulse does four jobs. The health report joins the fields Task Scheduler keeps apart and
+prints one verdict per task. With `--history` it also reads what became of each launch, so a run
+that never ends is `STUCK` and a task whose latest launch was refused is `BLOCKED`. The lint
+(`--lint`) reads each task's configuration and names what will make the next run fail or be
+skipped: a logon type that only runs while somebody is logged on, a logon type that differs from
+the tasks beside it, a `Start In` that is empty, quoted or relative, a share the run-as account
+cannot reach, a program that only `PATH` can find, a run with no time limit, a trigger that has
+ended. `--diff OLD NEW` compares two exports of the same tasks and names each field that changed,
+so the logon type that flipped last night is a row, not a hunt. The lint and the diff read
+exported task XML, so they run on any OS. Standard library only, no install, no config file, no
+credentials.
 
 ```console
 $ python taskpulse.py --self-test
@@ -38,6 +43,7 @@ PASS  access denied after a good range probe, the shape the script sends, still 
 PASS  a watermark above the log's newest record, as after a clear, raises, never an empty history  <-- pinned defect
 ...
 PASS  records past the watermark that the log overwrote make the read incomplete  <-- pinned defect
+...
 PASS  a cold start on a log younger than 7 days is incomplete  <-- pinned defect
 ...
 PASS  past a watermark the read is oldest first, so a backlog is never skipped, and takes no time window  <-- pinned defect
@@ -56,6 +62,20 @@ PASS  an Error older than 7 days counts as neither a run nor a failure of the we
 PASS  past a watermark the columns count every run read, however old, and say they start at the watermark, not 'the last 7 days'  <-- pinned defect
 ...
 PASS  a failed history read leaves the run counts empty and says so, never a clean week with 0 runs  <-- pinned defect
+...
+PASS  event 103, the action could not start, makes the run an Error with its code, though no 102 or 201 followed  <-- pinned defect
+...
+PASS  event 101 has no instance id, because no instance existed: each is a run of its own, named after its record, and an Error  <-- pinned defect
+...
+PASS  a terminated or user-stopped run is a Warning and over, a run stopped for exceeding its time limit is an Error, and none of them is Running  <-- pinned defect
+...
+PASS  a 322 naming a running instance neither ends it nor moves its start  <-- pinned defect
+...
+PASS  a run with no end event on a task that is Ready or Queued is a lost end event, not a stuck run  <-- pinned defect
+...
+PASS  a run that is only 2 hours old is STUCK when later launches were ignored because it was still running (event 322)  <-- pinned defect
+...
+PASS  a history read that failed ignores any fate: nothing was read, so nothing is judged  <-- pinned defect
 ...
 PASS  a CSV cell a spreadsheet would run as a formula is written as text  <-- pinned defect
 ...
@@ -80,11 +100,33 @@ PASS  cmd cannot cd to a share  <-- pinned defect
 PASS  a cd to a relative folder resolves against System32 itself  <-- pinned defect
 PASS  a Set-Location to a relative folder resolves against System32 itself  <-- pinned defect
 ...
+PASS  a secret in the Command field is masked in the lint finding and in the target, and a path with spaces is not touched  <-- pinned defect
+...
 PASS  utf-8 bytes whose declaration still says UTF-16 parse  <-- pinned defect
 ...
 PASS  a disabled Daily trigger never fires, so a task left with a logon trigger is not interactive-only  <-- pinned defect
 ...
 PASS  an export with no <Enabled> element, as Windows writes every enabled task, is linted  <-- pinned defect
+...
+PASS  an unlimited run on a task with no MultipleInstancesPolicy is a Warning: the schema default, IgnoreNew, drops every later launch  <-- pinned defect
+...
+PASS  a task whose every trigger has ended is a Warning that names the last end and the result code Task Scheduler gives it  <-- pinned defect
+...
+PASS  the one task whose logon type differs from two neighbours is named, with theirs
+...
+PASS  a setting written out at its default, in any case, equals one left out  <-- pinned defect
+...
+PASS  a monthly trigger that moves one of its repeated Day or Week values is a change; the last value kept used to hide it  <-- pinned defect
+PASS  a timestamp past the last UTC instant is None, not an OverflowError  <-- pinned defect
+...
+PASS  a logon change on a task that runs ArcGIS Pro's Python also names the licence conditions  <-- pinned defect
+...
+PASS  the password in a URL is masked, wherever the URL sits, and a URL with no password is not touched  <-- pinned defect
+...
+PASS  the value of -P, -p and --auth is masked, and --author and other letters are not  <-- pinned defect
+...
+PASS  no secret reaches the json diff of command line 7  <-- pinned defect
+PASS  a change to a secret is reported as a change, with the value left out  <-- pinned defect
 ...
 PASS  a subfolder the walk cannot list stops the read, not a clean lint  <-- pinned defect
 PASS  a subfolder that is a symbolic link, which the walk lists but never enters, stops the read  <-- pinned defect
@@ -93,9 +135,12 @@ PASS  a capped cold read that does not reach back 7 days exits 1, never a clean 
 ...
 PASS  the default report keeps a task whose last run was green but whose week was not  <-- pinned defect
 ...
+PASS  --stuck-hours without --history, below 1, not a number, or typed as a prefix is a usage error  <-- pinned defect
+...
 PASS  access denied after the range row exits 1 and never moves the watermark  <-- pinned defect
 PASS  an access-denied history read names the error, still prints the snapshot and keeps the Error task's exit 2  <-- pinned defect
 PASS  an access-denied history read with no task in Error exits 1, never 0
+...
 PASS  a disabled operational log exits 1 and says so, never a clean week with 0 runs  <-- pinned defect
 ...
 PASS  the json of an access-denied read differs from a clean read of an empty log: null run counts, not 0  <-- pinned defect
@@ -112,6 +157,14 @@ PASS  --out as a hard link to the export is refused  <-- pinned defect
 ...
 PASS  a prefix of --apply, such as --ap, is refused and writes nothing  <-- pinned defect
 ...
+PASS  --diff of two exports that hold only Microsoft's own tasks has no result: exit 1 and a notice, never 'No differences'  <-- pinned defect
+...
+PASS  --lint of an export that holds only Microsoft's own tasks has no result: exit 1 and a notice, never 'No findings'  <-- pinned defect
+...
+PASS  --out on an export that --diff compares is refused and the export is untouched  <-- pinned defect
+...
+PASS  --diff takes exactly two paths, cannot be combined with --lint or --history, and cannot be typed as a prefix  <-- pinned defect
+...
 PASS  --history 0 or less, which matches no event, and --since-record-id without --history or below 0 are usage errors, not an empty history  <-- pinned defect
 PASS  --history below 7 days is a usage error: a shorter read would still label its columns 'the last 7 days'  <-- pinned defect
 ...
@@ -122,28 +175,53 @@ PASS  importing taskpulse runs nothing and prints nothing
 PASS  the import probe writes no .pyc beside the script  <-- pinned defect
 os message table: present
 --------------------------------------------------------------------
-501 assertions, 0 failed
+653 assertions, 0 failed
 ```
 
-The same command prints `501 assertions, 0 failed` on Windows with Python 3.13 and on Ubuntu
-with Python 3.12, and on Windows with Python 3.9. On Linux there is no OS message table, so
-the line above the footer rule reads
-`os message table: absent, so its assertions check the unmapped fallback`. Six assertions then
-check the `unmapped result 0x...` text instead of the Windows wording, and the count stays equal.
+The same command prints `653 assertions, 0 failed` on Windows with Python 3.13, 3.12 and 3.9, and
+on Ubuntu with Python 3.12. On Linux there is no OS message table, so the line above the footer
+rule reads `os message table: absent, so its assertions check the unmapped fallback`. Six
+assertions then check the `unmapped result 0x...` text instead of the Windows wording, and the
+count stays equal.
 
 The lint, run on Linux against a synthetic `schtasks /query /xml ONE` export (every name in it
-is made up):
+is made up). The two `logon-minority` rows are the incident in one view: two jobs of one account
+use a logon type that differs from the one that the four others in their folder share:
 
 ```console
 $ python3 taskpulse.py --lint gis-tasks.xml
 SEVERITY  TASK                         CHECK             DETAIL
---------  ---------------------------  ----------------  -------------------------------------------------------------------------------------------------------------------------------------------------------
+--------  ---------------------------  ----------------  -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
 Error     \GIS\export-to-share         s4u-network       logon type is S4U ('Do not store password'), which has no network credentials, so \\fileserver\gis is unreachable
 Error     \GIS\locator-rebuild         start-in-missing  Start In is empty, so the relative path rebuild.py resolves against C:\Windows\System32
 Error     \GIS\nightly-parcel-refresh  interactive-only  logon type is interactive: the task runs only while EXAMPLE\svc-etl is logged on, so its Daily trigger does nothing when nobody is
 Error     \GIS\tile-cache              start-in-quoted   Start In "C:\tile work" is quoted; Task Scheduler does not strip the quotes and the task fails to start with 0x8007010B (the directory name is invalid)
+Warning   \GIS\export-to-share         logon-minority    logon type s4u differs from the 4 other task(s) in this folder that run as EXAMPLE\svc-etl, which use password: if this is not deliberate, a settings change flipped it
 Warning   \GIS\locator-rebuild         bare-program      python.exe has no folder, so it resolves against Start In and then the run-as account's PATH; which program runs, if any, depends on that account
+Warning   \GIS\nightly-parcel-refresh  logon-minority    logon type interactive differs from the 4 other task(s) in this folder that run as EXAMPLE\svc-etl, which use password: if this is not deliberate, a settings change flipped it
+Warning   \GIS\report-mailer           no-time-limit     ExecutionTimeLimit is PT0S (run indefinitely), so a hung run never ends and every later launch is dropped without an error (Task Scheduler logs each as event 322, which --history reports)
 Warning   \GIS\sync-to-mapped-drive    mapped-drive      Z: is not a declared local drive (--local-drives); a mapped drive does not exist in a non-interactive logon, so use the UNC path
+$ echo $?
+2
+```
+
+The diff, run on Linux against two synthetic exports of the same tasks, taken a day apart. The
+logon type of `nightly-parcel-refresh` flipped, and because that task runs ArcGIS Pro's Python
+the diff adds the licence note. `report-mailer` lost its time limit. `tile-cache` moved its
+trigger and changed a token that the diff does not print. `unchanged` had its default settings
+written out in the second export, and it is not a row:
+
+```console
+$ python3 taskpulse.py --diff monday.xml tuesday.xml
+CHANGE   TASK                         FIELD                       OLD                                                                                  NEW
+-------  ---------------------------  --------------------------  -----------------------------------------------------------------------------------  -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+removed  \GIS\export-to-share
+added    \GIS\locator-rebuild
+changed  \GIS\nightly-parcel-refresh  logon type                  Password                                                                             InteractiveToken
+changed  \GIS\nightly-parcel-refresh  arcpy-licence                                                                                                    this task runs ArcGIS Pro's Python: arcpy raises RuntimeError: NotInitialized unless Esri's sign-in conditions hold for the account that runs it, and a task definition does not show them, so check them for the new account or logon type
+changed  \GIS\report-mailer           setting ExecutionTimeLimit  PT1H                                                                                 PT0S
+changed  \GIS\tile-cache              trigger                     Daily Enabled=true, ScheduleByDay.DaysInterval=1, StartBoundary=2026-01-01T02:00:00  Daily Enabled=true, ScheduleByDay.DaysInterval=1, StartBoundary=2026-01-01T03:30:00
+changed  \GIS\tile-cache              action 1                    Exec C:\Python39\python.exe C:\jobs\tile_cache.py --token *** [Start In C:\jobs]     Exec C:\Python39\python.exe C:\jobs\tile_cache.py --token *** [Start In C:\jobs] (a value changed that is not printed)
 $ echo $?
 2
 ```
@@ -167,12 +245,29 @@ XPath on the event's `TaskName` gives the same join from a script. What `--histo
 one pass over every task: the runs and failures of the week, a duration baseline, and an exit
 code that a monitoring check can read.
 
+The same History tab already shows the run-fate events: a task that failed to start (`101`),
+a run that was terminated (`111`) and a launch that was ignored because the task was still
+running (`322`). Each is exact, and each has Microsoft's own message text. What the tab does not
+do is rank them. It does not say that a run which began 40 hours ago and never ended is stuck,
+or that the last launch of a task was refused and nothing has started since. taskpulse applies
+those two rules to every task at once.
+
+For the diff, the existing alternative is a text diff of two exports: `schtasks /query /xml ONE`
+or `Export-ScheduledTask`, then `fc`, `diff` or `Compare-Object`. It shows every byte that
+changed, and it needs nothing new. On the development machine, `Export-ScheduledTask` and
+`schtasks` wrote the same XML for most tasks, once indentation and the XML declaration were
+ignored, and the rest differed in one quote character of a description. So a text diff is
+a good tool for two exports from one writer. It is not enough when the export changes shape
+without the task changing: a setting written out at its default, triggers in another order, or
+a new registration date. Those are text changes and not task changes. `--diff` does not report
+them, and it names the field when something did change.
+
 ## Requirements
 
 Any Python 3.9 or later. The health report and the live lint need Windows, because they shell
 out to the built-in `Get-ScheduledTask` / `Get-ScheduledTaskInfo` cmdlets, and to
-`Get-WinEvent` when you pass `--history`. The lint on exported XML (`--lint PATH`) needs only
-Python, on any OS. Nothing to install, nothing to configure, no credentials. Readers used to
+`Get-WinEvent` when you pass `--history`. The lint on exported XML (`--lint PATH`) and the diff
+(`--diff OLD NEW`) need only Python, on any OS. Nothing to install, nothing to configure, no credentials. Readers used to
 Esri tooling should note that this needs no ArcGIS Pro, no `arcpy`, no `arcgis` package, and
 no portal sign-in.
 
@@ -186,9 +281,9 @@ What it refuses to do:
 
 The only write is `--out`, and it needs `--apply`. Without `--apply`, `--out` writes nothing.
 The report goes to stdout, and stderr names the file that was not written. `--apply` without
-`--out` is a usage error. So is an `--out` path that is an export the same run lints, or a
-file inside a folder it lints, because one mistyped path would replace the export with its own
-findings. The paths are compared as files, not as strings, so a `\\?\` spelling of the export
+`--out` is a usage error. So is an `--out` path that is an export the same run lints or
+compares, or a file inside a folder it reads, because one mistyped path would replace the
+export with its own findings. The paths are compared as files, not as strings, so a `\\?\` spelling of the export
 or a hard link to it is refused too. `--self-test` also writes its synthetic task files to a
 temporary folder, which it removes. It writes no `__pycache__` beside the script, and an assertion checks that.
 
@@ -200,23 +295,26 @@ cd taskpulse
 python taskpulse.py --self-test
 ```
 
-That is the whole setup. `--self-test` runs 501 assertions with no network, no credentials and
+That is the whole setup. `--self-test` runs 653 assertions with no network, no credentials and
 no Task Scheduler access, so it passes on a locked-down box and in CI. Then run
-`python taskpulse.py` for the health report, or `python taskpulse.py --lint` for the lint.
+`python taskpulse.py` for the health report, `python taskpulse.py --lint` for the lint, or
+`python taskpulse.py --diff old.xml new.xml` to compare two exports.
 
 ## Usage
 
 | Flag | Effect |
 |---|---|
-| `--format {table,json,csv}` | Output format. Default `table`. For the health report, `json` and `csv` carry all 21 fields per row and the table shows 5. Lint rows have 4 fields in every format. In `csv`, a cell that starts with `=`, `+`, `-`, `@`, a tab or a carriage return gets a leading `'`, because a spreadsheet runs such a cell as a formula and a task's author, account and command are text that anybody who registers a task can set. |
-| `--out PATH` | With `--apply`, write to `PATH` in UTF-8 instead of stdout. The row count goes to stderr. Refused when `PATH` is an export this run lints, or inside a folder it lints, under any spelling or through a hard link. |
+| `--format {table,json,csv}` | Output format. Default `table`. For the health report, `json` and `csv` carry all 23 fields per row and the table shows 5. Lint rows have 4 fields in every format, and diff rows have 5 (`change`, `task`, `field`, `old`, `new`). In `csv`, a cell that starts with `=`, `+`, `-`, `@`, a tab or a carriage return gets a leading `'`, because a spreadsheet runs such a cell as a formula and a task's author, account and command are text that anybody who registers a task can set. |
+| `--out PATH` | With `--apply`, write to `PATH` in UTF-8 instead of stdout. The row count goes to stderr. Refused when `PATH` is an export this run lints or compares, or inside a folder it reads, under any spelling or through a hard link. |
 | `--apply` | Write `--out`. Without it nothing is written, and the report goes to stdout. |
-| `--all` | Include Microsoft's own tasks under `\Microsoft\`. Excluded by default because there are roughly 200 of them. |
+| `--all` | Include Microsoft's own tasks under `\Microsoft\`. Excluded by default because there are so many. This holds for `--lint PATH` and `--diff` too: they skip those tasks in the files they read, print how many on stderr, and exit `1` when none was left. |
 | `--show-ok` | Include healthy tasks. By default only `Warning` and `Error` rows print. With `--lint`, each task with no findings gets one `OK` row. |
 | `--match REGEX` | Keep only tasks whose full path matches this regex, case insensitive. |
-| `--history [DAYS]` | Also read the Task Scheduler Operational log and report each task's last 7 days of runs, its failures in that week, and its duration baseline. `DAYS` is the window of events the read searches. The default is `30`, and it must be `7` or more, because the columns cover 7 days. With no watermark, a read takes at most 5000 events, newest first. A log that is disabled or cannot be read leaves the report without run history and makes the exit code `1`, or `2` when a task is in `Error`. Cannot be combined with `--lint`. |
+| `--history [DAYS]` | Also read the Task Scheduler Operational log and report each task's last 7 days of runs, its failures in that week, its duration baseline, and whether it is `STUCK` or `BLOCKED` (see [Run fate](#run-fate)). `DAYS` is the window of events the read searches. The default is `30`, and it must be `7` or more, because the columns cover 7 days. With no watermark, a read takes at most 5000 events, newest first. A log that is disabled or cannot be read leaves the report without run history and makes the exit code `1`, or `2` when a task is in `Error`. Cannot be combined with `--lint` or `--diff`. |
+| `--stuck-hours HOURS` | With `--history`, a run with no end event after this many hours is `STUCK`. Default `24`. It must be `1` or more. Without `--history`, it is a usage error. |
 | `--since-record-id ID` | With `--history`, read only event records newer than `ID`, oldest first. Pass the watermark the previous run printed, even `0`: `0` reads the whole log, oldest first. The day window is then ignored, and the run columns count the runs since `ID`, not the last 7 days (see [Run history](#run-history)). Without `--history`, or below `0`, it is a usage error. |
 | `--lint [PATH ...]` | Report configuration findings instead of run health. With no `PATH`, lint the live Task Scheduler (Windows). With one or more `PATH`s, lint exported task XML files or folders (any OS). |
+| `--diff OLD NEW` | Compare two exports of the same tasks (files or folders, any OS) and print one row for each field that changed, each task added and each task removed. Exits `0` when the tasks it compared match and `2` when they differ, and `1` when every task was under `\Microsoft\` and skipped (see [Task definition diff](#task-definition-diff)). Takes exactly two paths. Cannot be combined with `--lint` or `--history`. |
 | `--local-drives LETTERS` | With `--lint`, the drive letters that are local disks, comma separated. Default `C`. Any other letter is reported as a possible mapped drive. |
 | `--timeout SECONDS` | Task Scheduler query timeout. Default `120`. |
 | `--self-test` | Run the offline assertion suite and exit. |
@@ -225,11 +323,14 @@ no Task Scheduler access, so it passes on a locked-down box and in CI. Then run
 
 Exit codes: `0` when nothing is in an `Error` state and taskpulse saw everything it reports
 on. `2` when at least one task is in `Error` (or, with `--lint`, when at least one finding is
-an `Error`). `64` for a usage error, such as a mistyped flag or an invalid `--match` regex.
+an `Error`). With `--diff`, `2` means the two exports differ in at least one row, and `0` means
+they match. `64` for a usage error, such as a mistyped flag or an invalid `--match` regex.
 `1` when taskpulse itself failed, or could not see everything:
 
-* an unreadable export, a subfolder of a linted folder that cannot be listed or is a symbolic
-  link, or a failed inventory read; no report prints then
+* a `--lint PATH` or `--diff` whose tasks were all under `\Microsoft\` and skipped, so nothing
+  was examined; pass `--all`
+* an unreadable export (with `--diff`, either of the two), a subfolder of a linted folder that
+  cannot be listed or is a symbolic link, or a failed inventory read; no report prints then
 * an `--out` it could not write
 * a task whose run details, actions or triggers the live read could not get
 * an Operational log that is disabled or that `--history` cannot read
@@ -249,7 +350,9 @@ succeeded tonight is worth printing. It never makes the exit code `2`: that stil
 current state alone. When the history read fails or is incomplete, the report still prints,
 stderr says why, the `WHY` column says `run history unread` or `run history incomplete`, and
 the exit code is `1`. When a task is in `Error`, the exit code is `2` all the same, so a
-disabled log never hides a failing task from a check.
+disabled log never hides a failing task from a check. A `STUCK` or `BLOCKED` task is a
+`Warning`. Like the other warnings, it prints in the default report and leaves the exit code
+alone, so a check that must fail on one reads the `fate` field of the `json` or `csv` output.
 
 A real health run on the development machine, scoped with `--match`:
 
@@ -263,7 +366,7 @@ Error   \ViGEmBus_Updater                   Daily         unmapped result 0x0000
 
 ## Configuration lint
 
-`--lint` reads each enabled task's principal, triggers and every `Exec` action, and reports
+`--lint` reads each enabled task's principal, triggers, settings and every `Exec` action, and reports
 these checks. A finding is an `Error` when the next run cannot work as configured. It is a
 `Warning` when the result depends on something taskpulse cannot see offline.
 
@@ -277,6 +380,10 @@ these checks. A finding is an `Error` when the next run cannot work as configure
 | `start-in-relative` | Error | `Start In` is not an absolute path. |
 | `start-in-missing` | Error with a relative path, Warning for a script | `Start In` is empty. It is an Error when the action names a relative file path that the lint can see, and a Warning when it runs a script that might open one. A body run by `cmd /c` or `powershell -Command` that starts with `cd`, `pushd` or `Set-Location` and an absolute folder is exempt, quoted or not. An absolute folder starts with a drive and a separator, with `\`, or with a `%VARIABLE%`, or in PowerShell with a `$variable`. A relative folder, as in `cd scripts`, is not exempt, because it resolves against `C:\Windows\System32` too. A `cd` later in the body comes too late and is not exempt. In `cmd`, four more are not exempt: `cd %JOBS%` without `/d`, because the variable can name another drive; `cd D:\jobs` without `/d`, because it keeps the current drive; `cd C:`, which only prints that drive's current folder; and `cd \\server\share`, because `cmd` cannot make a share its current folder. `pushd \\server\share` maps the share and is exempt. |
 | `bare-program` | Warning | The program has no folder, such as `python.exe`, and is not one of the Windows programs that are on every account's `PATH`. |
+| `no-time-limit` | Warning | `ExecutionTimeLimit` is zero (`PT0S`, "run indefinitely") and `MultipleInstancesPolicy` is not `StopExisting`. A hung run never ends. Under the default policy, `IgnoreNew`, every later launch is dropped without an error, and under `Queue` they wait behind it. Under `Parallel` they pile up beside it. Only `IgnoreNew` drops launches, so only its finding names event `322` ("Launch request ignored, instance already running"), which `--history` reads. |
+| `run-conditions` | Warning | `RunOnlyIfIdle` or `RunOnlyIfNetworkAvailable` is true. The task is set to run only while the computer is idle, or only while a network is available, so a trigger that fires while that is false can leave the run unstarted, and `Last Run Result` still shows the previous run. |
+| `trigger-expired` | Warning | Every enabled trigger has an `EndBoundary` more than a day in the past, so no trigger can start the task again. Task Scheduler reports `0x00041304` ("no more runs"), which the health report counts as a non-error. A time with no zone is the machine's local time, which an export does not say, so a trigger counts as ended only a day after its end. |
+| `logon-minority` | Warning | The task's logon type differs from its neighbours. Neighbours are the enabled tasks in the same folder that run as the same account. The type has to be shared by two or more of them, and by more than any other type, so a tie names nobody. A heuristic: a task can differ on purpose. |
 | `read-failed` | Warning | The live read could not get the task's actions, triggers or run details, so the other checks may have missed a finding. An exported XML task never gets it. |
 
 "A script" means the action runs an interpreter or a script file: Python, PowerShell, `cmd`,
@@ -364,9 +471,50 @@ has an assertion in the self-test:
   the link. A Windows junction is walked like a folder, and its tasks are linted.
 
 With `--all`, a live `--lint` and a `--lint` of `schtasks /query /xml ONE` from the same
-machine produced the same 20 findings, with the same task, check and severity in the same
-order. Only the account named in 15 `interactive-only` details differs. The XML names the
-principal by SID, and the live read names the user, or says "its user" for a group principal.
+machine produced the same findings, with the same task, check and severity in the same
+order, in five checks: `run-conditions`, `no-time-limit`, `interactive-only`, `start-in-missing`
+and `bare-program`. Only the account named in the `interactive-only` details differs. The XML
+names the principal by SID, and the live read names the user, or says "its user" for a group
+principal. The new checks needed the live query to ask for more, so it now also reads each
+task's `MultipleInstancesPolicy`, `ExecutionTimeLimit`, `RunOnlyIfIdle` and
+`RunOnlyIfNetworkAvailable`, and each trigger's `EndBoundary`. Without `--all`, the live lint
+of the development machine gave a short list of findings in four checks: `interactive-only`,
+`start-in-missing`, `bare-program` and `run-conditions`.
+
+### Silent skips, and the defaults that hide them
+
+A run that is skipped leaves no failure. `Last Run Result` keeps the last run's code, so the
+health report reads green. Three checks above (`no-time-limit`, `run-conditions`,
+`trigger-expired`) look for the configuration that does this, and `logon-minority` looks for
+the change that starts it. They apply the Task Scheduler schema's defaults to what an export
+leaves out, because an absent element is a setting, not a gap. Every default below is from
+Microsoft's documentation:
+
+| Setting | Default when the element is absent | Source |
+|---|---|---|
+| `MultipleInstancesPolicy` | `IgnoreNew`: "Does not start new instance if an existing instance of the task is running." | [multipleInstancesPolicyType](https://learn.microsoft.com/en-us/windows/win32/taskschd/taskschedulerschema-multipleinstancespolicytype-simpletype) |
+| `ExecutionTimeLimit` | 72 hours: "By default, a task will be stopped 72 hours after it starts to run." `PT0S` runs indefinitely. | [ITaskSettings::ExecutionTimeLimit](https://learn.microsoft.com/en-us/windows/win32/api/taskschd/nf-taskschd-itasksettings-get_executiontimelimit) |
+| `RunOnlyIfIdle`, `RunOnlyIfNetworkAvailable` | `false` | [settingsType](https://learn.microsoft.com/en-us/windows/win32/taskschd/taskschedulerschema-settingstype-complextype) |
+| `Enabled`, `AllowStartOnDemand`, `AllowHardTerminate`, `DisallowStartIfOnBatteries`, `StopIfGoingOnBatteries` | `true` | settingsType |
+| `StartWhenAvailable`, `WakeToRun`, `Hidden`, `UseUnifiedSchedulingEngine`, `DisallowStartOnRemoteAppSession` | `false` | settingsType |
+| `Priority`, `DeleteExpiredTaskAfter` | `7`, `PT0S` | settingsType |
+
+`ExecutionTimeLimit` is the one default that the schema does not give: its element has no
+`default=` attribute, and the 72 hours come from the `ITaskSettings` page. The two agree in
+practice. On the development machine, `schtasks /query /xml ONE` left the `ExecutionTimeLimit`
+element out of many tasks, and the live read reported `PT72H` for every one of them. For the
+others, the XML and the live read gave the same limit. The default is why the lint treats an
+absent limit as 72 hours, not as unlimited, and why the two readers agree.
+
+Two defaults are not applied, because Microsoft documents none. The principal's `LogonType`
+page lists `S4U`, `Password` and `InteractiveToken` and says nothing about an absent one, so an
+absent `LogonType` is unknown and no logon check fires on it. The `RunLevel` page lists no
+default either, so `--diff` shows an absent run level as blank.
+
+`logon-minority` is the one check here that is not a Task Scheduler rule. The disaster in
+this README was a logon type that changed on one task while its neighbours kept theirs. The
+check compares each task with the tasks beside it, and it cannot know whether the change was
+deliberate, so it is a Warning that names the type everyone else uses.
 
 ## Run history
 
@@ -377,13 +525,15 @@ task at a time.
 
 `--history` joins it to every task in one pass. It reads events `100` (task started), `102`
 (task completed), `200` (action started) and `201` (action completed, with its result code)
-from `Microsoft-Windows-TaskScheduler/Operational`. It groups them by instance id into one
+from `Microsoft-Windows-TaskScheduler/Operational`, and nine run-fate events that say a launch
+ended some other way (see [Run fate](#run-fate)). It groups them by instance id into one
 row per run, and folds five columns onto each task: `runs_last_7_days`, `failures_last_7_days`,
 `last_duration_seconds`, `duration_ratio` and `is_duration_anomaly`. A task whose last run was
 green but whose week was not now prints, with the count in the `WHY` column. A task with
 several actions writes one `201` per action, and a failed action makes the run fail, whatever
 the other actions returned, warning codes included. A failed `201` counts at once, even
-while the run's later actions still run.
+while the run's later actions still run. Two more columns, `fate` and
+`blocked_launches_last_7_days`, come from the run-fate events.
 
 Each row also has a `history` field, which says how its run columns were read:
 
@@ -394,8 +544,9 @@ Each row also has a `history` field, which says how its run columns were read:
 * `incomplete`: the event cap or the log's range left runs unread. The counts are a lower
   bound, and `WHY` says `run history incomplete`.
 * `complete`: the read covered the whole period that the counts describe. A task with no
-  run in the read counts `0`. A run that never launched is still not counted as a failure
-  (see Limitations).
+  run in the read counts `0`. A run whose start failed (events `101`, `103`, `203`) counts as a
+  failure. A launch that Task Scheduler refused (`153`, `322`, `332`) is not a run at all, and
+  has its own count.
 
 A failed read never writes `0` runs and `0` failures. So a saved `--out` file of a failed read
 differs from the file of a clean read of an empty log only when it holds at least one row. When
@@ -447,8 +598,8 @@ in `Error`:
 
 The same script, pointed at the Application log of the development machine with the cap set
 to 3, was run with a watermark of `1000000000000`. It exited `1` with "is above the newest record of the log
-(9652157)". A watermark of `100` exited `1` with "the log no longer holds records 101 to
-9626824". A watermark at the newest record exited `0`.
+(N)", where N was the log's newest record id. A watermark of `100` exited `1` with "the log no
+longer holds records 101 to M", where M was one below its oldest record id. A watermark at the newest record exited `0`.
 
 The two modes answer different questions:
 
@@ -492,6 +643,146 @@ The duration baseline is advisory. It never changes a task's health verdict, and
 until a task has five completed runs in one read, so a new job cannot set a baseline off one
 sample. With a watermark, a nightly task polled nightly has one run per read, so its baseline
 never arms. Run a cold `--history` now and then to see it.
+
+### Run fate
+
+A launch can end in ways that no `201` event records, and that `Last Run Result` hides behind
+the last good run. Windows lists them in the log's provider manifest. This table is from
+`Get-WinEvent -ListProvider Microsoft-Windows-TaskScheduler`, reading its `Events`, on Windows
+11 build 26100. The names are the manifest's own.
+
+| Event | Manifest name | Fields it carries | What taskpulse makes of it |
+|---|---|---|---|
+| `101` | Task Start Failed | task, user, result code | A run of its own, because no instance existed. It is an `Error`, and counts as a failure. |
+| `103` | Action start failed | task, instance, user, result code | The run is an `Error`. |
+| `203` | Action failed to start | task, instance, action, result code | The run is an `Error`. |
+| `111` | Task terminated | task, instance | The run is over and is a `Warning`. |
+| `329` | Task stopping due to timeout reached | task, instance | The run is over and is an `Error`: the scheduler stopped it for exceeding its time limit. |
+| `330` | Task stopping due to user request | task, instance, user | The run is over and is a `Warning`. |
+| `153` | Missed task start rejected | task | A refused launch of kind `missed`. |
+| `322` | Launch request ignored, instance already running | task, the running instance | A refused launch of kind `overlap`. It names the instance that was still running. |
+| `332` | Launch condition not met, user not logged-on | task, user | A refused launch of kind `no-session`. |
+
+A run that `111`, `329` or `330` ended gets no end time and no duration, so it never reaches
+the duration baseline. A refused launch is not a run, so `runs_last_7_days` does not count it.
+The history script needed no change to read these events. The task name, the instance id (as
+`InstanceId` or `TaskInstanceId`) and the result code have the same names in every one of them.
+
+Two rules turn those events into a verdict for each task:
+
+* **STUCK.** A run has no end event, and the task's own `state` is not `Ready` or `Queued`,
+  and either the run began `--stuck-hours` ago or more (default 24), or Task Scheduler logged
+  a `322` that names the run's instance. A task whose state is `Ready` is not running, so a run
+  with no end event there is a lost end event, and it is not called stuck. A state that is
+  missing, as in an export, rules nothing out.
+* **BLOCKED.** The task is not stuck, and its latest refused launch inside the window is newer
+  than its latest start in this read, so nothing has run since. The window is the one the run
+  columns use: the last 7 days, or everything since the watermark.
+
+Two columns carry the result. `fate` is `STUCK`, `BLOCKED` or empty. `blocked_launches_last_7_days`
+counts the refused launches in the window, `0` for a quiet task, and is `null` when the
+history was not read. A `STUCK` or `BLOCKED` task is at least a `Warning`, so the default report
+keeps its row, and the `WHY` column starts with the reason. An `Error` stays an `Error` and a
+disabled task stays disabled. The exit code does not change. A run against synthetic tasks and
+events, because the Operational log of the development machine is disabled. The self-test builds
+the same stub and checks that its table has these four rows (the check named "the run-fate
+example in the README"), but it does not print the table:
+
+```console
+$ python taskpulse.py --history
+taskpulse: read 13 run event(s); next run can pass --since-record-id 23
+STATUS   TASK                         SCHEDULE  LAST RESULT                              WHY
+-------  ---------------------------  --------  ---------------------------------------  ------------------------------------------------------------
+Error    \GIS\locator-rebuild         Daily     The user name or password is incorrect.  The user name or password is incorrect.; 1 of 1 run(s) in th
+Warning  \GIS\nightly-parcel-refresh  Daily     success                                  STUCK: a run started 40.0 hour(s) ago has not finished; task
+Warning  \GIS\report-mailer           Daily     success                                  STUCK: a run started 50.0 hour(s) ago has not finished; 2 la
+Warning  \GIS\tile-cache              Daily     success                                  BLOCKED: the latest launch was refused because the run-as us
+$ echo $?
+2
+```
+
+`report-mailer` is stuck by the `322` rule: two later launches were ignored while it ran. The
+`json` row says so in full: `STUCK: a run started 50.0 hour(s) ago has not finished; 2 later
+launch(es) were ignored while it ran (event 322); task is currently running`, with
+`blocked_launches_last_7_days` at 2. `tile-cache` ran 30 hours ago, and a `332` came 5 hours
+ago. The exit code is `2` because `locator-rebuild` is in `Error`; the two stuck tasks and the
+blocked one are warnings.
+
+`--stuck-hours` moves the threshold, and the `322` rule ignores it. A job that legitimately
+runs for 30 hours needs `--stuck-hours 36`. Neither rule needs the event log to be complete:
+a refused launch in the window blocks a task even when its last run is out of the read.
+
+## Task definition diff
+
+`--diff OLD NEW` reads two exports of the same tasks, files or folders, in any of the shapes
+`--lint` reads, and prints one row for each task that was added, each task that was removed,
+and each field of a task that changed. A task is matched by its full name, without regard to
+case, so a rename is one removed task and one added task. The question it answers is "what
+changed", and the answer is a field name with the old and the new value.
+
+What it compares, and how it makes two spellings of one thing equal:
+
+* **The account, its logon type and its run level.** `Interactive` and `InteractiveToken` are
+  one logon type, as are `InteractiveTokenOrPassword` and `Password`. An account is compared
+  without regard to case.
+* **Every `Settings` element, with the schema default applied** to a side that leaves it out
+  (see [the defaults](#silent-skips-and-the-defaults-that-hide-them)). A setting written out
+  at its default, in any case, equals one left out. An element with no documented default
+  compares as blank when absent.
+* **The triggers, in any order.** A trigger is its kind and every field below it, with
+  `Enabled` taken as true when the export says nothing. Two identical triggers are two
+  triggers: one of them is a row if the other export has only one.
+* **The actions, in order.** A program, its arguments and its `Start In`. A COM handler is
+  compared by every field but shown by its class id.
+
+It leaves out `RegistrationInfo`: the date, the author and the description change when a
+task is registered again, and they do not change what runs.
+
+Like the health report, `--diff` and `--lint PATH` skip the tasks under `\Microsoft\` unless
+`--all` is given. Each says on stderr how many tasks it skipped. When that leaves no task on
+either side, there is nothing to compare, so the exit code is `1` and the output is empty. It
+is never `No differences.` over zero tasks.
+
+The arguments of an action can hold a secret, and a diff prints both sides. So it prints them
+through `mask_arguments`, which replaces with `***`: the value of a switch whose name holds
+`key`, `token`, `secret`, `pass`, `pw`, `credential`, `auth` (but not `author`) or `bearer`; the
+value of a one-letter `-P` or `-p`, which is the password of `sqlcmd` and `mysql`; the word
+after such a switch that has no value of its own; a value with `=` or `+` in it and no file extension, which is how base64 keys
+and connection strings look; the password in the `user:password@host` of a URL; and every
+argument of `net`, which takes its password by position. A `cmd /c` body is masked word by
+word. When a secret changes and the mask makes both sides read the same, the row says
+`(a value changed that is not printed)`, so the change is not lost. The self-test greps the
+table, the `csv` and the `json` of seven such changes for the secrets, and finds none. The
+program field is masked the same way when it holds a command line, as in
+`sync.exe --password x`.
+
+### The licence note
+
+The README's disaster was a logon type that changed and took an `arcpy` licence with it.
+When the account, the logon type or the run level of a task changed, and the task runs ArcGIS
+Pro's Python, the diff adds a row named `arcpy-licence`. A task runs ArcGIS Pro's Python when
+its command line holds the `ArcGIS\Pro\bin\Python` folder, the `arcgispro-py3` environment or
+`propy`. Esri documents all three:
+[the default environment is `arcgispro-py3`](https://doc.esri.com/en/arcgis-pro/latest/arcpy/get-started/what-is-conda.html)
+and [`propy` starts Python](https://doc.esri.com/en/arcgis-pro/latest/arcpy/get-started/installing-python-for-arcgis-pro.html).
+
+Esri's page on running Python outside the application says that one of four conditions must
+hold, and that otherwise "a RuntimeError: NotInitialized exception appears when importing
+arcpy or arcgisscripting". The four are that "Sign me in automatically" was checked when
+signing in to ArcGIS Pro, that ArcGIS Pro is open, that it has been authorized to work
+offline, and that "Remember my certificate" was checked for a PKI portal. For a Named User
+licence, [the page on scheduling tools](https://doc.esri.com/en/arcgis-pro/latest/help/analysis/geoprocessing/basics/schedule-geoprocessing-tools.html)
+adds that "Sign in automatically" is required, and that the token "has a maximum expiration
+time set by the account administrator". None of this is in the task definition, and the diff
+cannot read it. The note says which task to check, and for which account. It is not a probe
+of the licence (see Limitations).
+
+On the development machine, the 13 tasks outside `\Microsoft\` were exported twice, with
+`Export-ScheduledTask` (one UTF-16 file per task, in a folder) and with `schtasks /query /xml ONE`
+(one file for every task). `taskpulse.py --diff` of the folder against the file gave
+`No differences.` and exit `0`. It also printed on stderr that the file's tasks under
+`\Microsoft\` were not examined. With `--all` the same command printed one `added` row for each
+of them, so the match holds only for the tasks outside `\Microsoft\`.
 
 ## Configuration
 
@@ -567,15 +858,83 @@ drops the declaration.
 name any other local disk with `--local-drives`. A letter it does not know is a Warning, not an
 Error, because only the machine knows whether `D:` is a disk or a mapping.
 
+**Reading a 322 as a run.** Event `322` carries an instance id, so the obvious join files it
+under that instance as one more event of the run. It is the opposite: it is a launch that did
+not happen, and the id it carries is the run that was still going. Filed as an event of that run,
+it would create a run out of nothing whenever the run's own events are outside the read, and
+that run would have the refusal's time as its start. So taskpulse keeps the refused launches (`153`, `322`, `332`) out
+of the run rows and reads a `322` only for what it says: this instance is holding up the task.
+
+**Treating an absent element as a gap.** A lint that skips a setting the export leaves out
+would pass a hand-written task, and a diff that compares the text would call the same task
+different once Windows writes the default out. On the development machine, most tasks have
+no `ExecutionTimeLimit` element, and every one runs under a 72-hour limit. So the lint and the
+diff both put the documented default in its place before they judge. Where Microsoft documents
+no default, as for `LogonType`, they put nothing in its place.
+
+**Diffing the XML as text.** A text diff reports every change in the file, and some of those are
+not changes in the task. A trigger list in another order, a setting written out at its default
+and a new registration date all change the text and nothing else. A diff that cannot tell them
+apart gets ignored the first night it reports one.
+
 ## Limitations
 
-* **The arcpy licence check is deferred.** The record of the incident above says that the
-  logon type changed. It does not say which logon type the task landed on. The lint catches
-  the logon changes that break a run as configured: an interactive-only logon on an unattended
-  trigger, and an S4U or built-in account that must reach a share. It does not catch a logon
-  that still runs the task but hides the licence from it. For example, an S4U job with only
-  local paths lints clean. The lint does not check where an ArcGIS licence lives, or whether a
-  given logon can read it. That needs `arcpy` and a live machine, and this tool has neither.
+* **There is no licence probe, only a licence note.** The record of the incident above says
+  that the logon type changed. It does not say which logon type the task landed on. The lint
+  catches the logon changes that break a run as configured: an interactive-only logon on an
+  unattended trigger, and an S4U or built-in account that must reach a share. The diff names
+  a changed account, logon type or run level on a task that runs ArcGIS Pro's Python, and
+  quotes the four conditions Esri documents (see [the licence note](#the-licence-note)). It
+  does not read whether those conditions hold, and a probe would need one of two things that
+  this tool does not have. Esri documents the conditions, but not where an account's sign-in
+  is kept, so a probe that reads a file or a registry key for it would rest on a claim that
+  cannot be checked against the documentation. The other way is to import `arcpy` as the
+  task's account, which needs that account, takes a licence, and is not read-only. An S4U job
+  with only local paths still lints clean.
+* **STUCK needs the run's start in the same read.** taskpulse keeps nothing between runs. With
+  a watermark, a run whose `100` event an earlier read took has no row in this read, and
+  nothing marks it stuck. Its next refused launch (`322`) still leaves the task `BLOCKED`. A
+  cold `--history` sees the whole window and finds it. A task with no instance that Task
+  Scheduler logged, such as one that hangs before its first event, has nothing to be stuck on.
+* **The run-fate path was exercised with synthetic events.** The Operational log of the
+  development machine is disabled, and enabling it needs an administrator. So no real
+  `101`, `103`, `111`, `153`, `203`, `322`, `329`, `330` or `332` event was read. What was run
+  for real: the provider manifest that names them, the history script's own event-to-row code
+  on synthetic event XML shaped like that manifest (all nine events came out with the right
+  task, instance and result code), and the 13-event filter against the Application log. The
+  rest is the self-test's stub. The link between the `IgnoreNew` policy and event `322` rests
+  on Microsoft's wording for both, which the README quotes, and not on a measured run.
+* **Five events from the manifest are not read.** `202` (action failed to complete), `328`
+  (stopped because the computer is no longer idle), `331` (failed to stop on timeout) and `333`
+  and `334` (launch refused in a RemoteApp or worker session) are not in the filter. A run that
+  one of them ends without a `201` reads as `Running` or `Unknown`.
+* **A run that was refused is counted by the log, not by the task.** `blocked_launches_last_7_days`
+  counts events. A task that fires every minute and is blocked all day has a large count, and one
+  that is blocked once has `1`; neither number is a measure of how long the block lasted.
+* **`--stuck-hours` is a guess.** The default of 24 hours suits a nightly job. A job that
+  legitimately runs longer is reported `STUCK` until its threshold is raised. The `322` rule
+  needs no threshold.
+* **A run slower than its repeat interval reads STUCK while it runs.** The `322` rule ignores
+  `--stuck-hours`, so a 90-minute job on an hourly trigger is `STUCK` as soon as one `322` names
+  it, even when it is healthy.
+* **BLOCKED does not check whether the run that caused it has finished.** A refusal that is
+  newer than the latest start in the read keeps the task `BLOCKED` after a green run, while it
+  is `Ready`, until its next launch starts. With a watermark, `BLOCKED` is judged only on the
+  events of the current read.
+* **A start with no end event can make a task STUCK later.** If the host rebooted mid-run, that
+  start stays open. Whenever the task is `Running` again, the report names the old run's age,
+  such as 240.0 hours, even beside a healthy 12-minute run.
+* **A disabled task whose last run never logged an end event is reported STUCK**, because only
+  `Ready` and `Queued` rule `STUCK` out.
+* **STUCK and BLOCKED never change the exit code.** A check that reads only the exit code stays
+  green over a hung job. Read the `fate` field of the `json` or `csv` output if a hung or
+  blocked job must fail a check.
+* **Event `101` is filed as a run of its own.** If Windows also logs a `103` or `203` for the
+  same failed launch, one failure counts twice. No real `101`, `103` or `203` event was read, so
+  this is unchecked.
+* **The health table cuts every cell at 60 characters.** Task names that differ only after
+  character 60 look identical, and the `WHY` text of a `STUCK` row can stop mid-word. Use
+  `--format json` for the full text.
 * **A relative path is found by its shape.** A token counts only when it has a folder
   separator or a known extension. `C:\R\bin\Rscript.exe job.R` with an empty `Start In` lints
   clean, because `.R` is not a known extension and `Rscript.exe` is not a known interpreter.
@@ -583,8 +942,8 @@ Error, because only the machine knows whether `D:` is a disk or a mapping.
   So does a secret after a one-letter switch, such as `sqlcmd -P`, and a password that `net use`
   takes inside a `cmd /c` body. With an empty `Start In`, each of these is a false
   `start-in-missing` Error, but the finding does not print the value, because it has no
-  known extension. A one-letter `-P` or `-p` is a port or a path as often as a password, so it
-  is not treated as a secret switch. A one-letter `-u` is not treated as an account switch,
+  known extension. A one-letter `-P` or `-p` is a port or a path as often as a password, so the
+  lint does not treat it as a secret switch (the diff's mask does). A one-letter `-u` is not treated as an account switch,
   because to `python` it is a switch with no value. So `psexec -u EXAMPLE\svc` with an empty
   `Start In` is a false Error too. A share inside a token with `=` in it, such as
   `Server=\\dbhost\gis;Database=x`, is not seen by the share check, because that token is
@@ -655,12 +1014,10 @@ Error, because only the machine knows whether `D:` is a disk or a mapping.
 * **One run can count in two watermark reads.** A read that sees a run's start but not its
   end counts it, and the read that sees the end counts it again, with an estimated start. The
   counts of each read are exact, but a total over several reads can count one run twice.
-* **Only a `201` result marks a failed run.** A run whose action never launched writes no
-  `201`, so it reads as `Unknown` and is not counted as a failure. taskpulse does not read the
-  `101`, `103` and `203` launch-failure events. A run that Task Scheduler ends with a `111`
-  event and no `102` or `201` stays `Running`, so it is not counted as a failure either. So a
-  `complete` read counts exactly the runs that wrote a `201` result. A run that failed to
-  launch is not counted as a failure.
+* **A launch that left no event is not counted.** A failed run needs a `201`, a `101`, a
+  `103`, a `203` or a `329` in the read. A run that Task Scheduler never logged, or whose events
+  the log overwrote, reads as nothing. A run that `111` or `330` ended is a `Warning`, and is
+  not counted as a failure.
 * **The `--history` join is case sensitive.** If the event log spells a task's path in another
   case than the inventory, for example after a re-registration, those runs join to no task and
   are not counted.
@@ -669,8 +1026,9 @@ Error, because only the machine knows whether `D:` is a disk or a mapping.
 * **The event filter is near the XPath limit.** The limit counts clauses, so it depends on the
   query form. On the Application log of the development machine, the watermark form ran with
   22 event ids and failed with 23 ("The specified query is invalid"). The cold-start form,
-  which adds the time window, ran with 21 and failed with 22. taskpulse names 4. A
-  `HISTORY_EVENT_IDS` past the limit would make every `--history` read exit `1`.
+  which adds the time window, ran with 21 and failed with 22. taskpulse now names 13, and
+  both forms ran with all 13 against the same log. A `HISTORY_EVENT_IDS` past the limit would
+  make every `--history` read exit `1`, and the self-test fails if the list grows past 21.
 * **An estimated start is late.** A run whose `100` event was not read takes its first event
   read as its start. That time is later than the real start, so a run that started just over
   7 days ago can still count towards the last 7 days.
@@ -696,14 +1054,19 @@ Error, because only the machine knows whether `D:` is a disk or a mapping.
   inventory and the event log are misspelled the same way, so the `--history` join still holds.
   A `--match` that spells the original name can miss such a task. Two tasks whose names differ
   only in such letters read as one name, so the `--history` join merges their runs.
-* **The lint example's export is not in the repo.** `gis-tasks.xml` above is a synthetic file
-  that is not one of the four files, so you cannot rerun that exact block.
-* **The measured counts are point-in-time.** The 15 `interactive-only` findings and the 20
-  findings above were measured once. A rerun on the same machine later gave 16 and 21, because
-  its task set changed.
-* **Linux coverage used a separate Python.** Branch coverage is 100 percent on Windows and on
+* **The example exports are not in the repo.** `gis-tasks.xml`, `monday.xml` and `tuesday.xml`
+  above are synthetic files that are not among the four files, so you cannot rerun those exact
+  blocks. A generator wrote them from the self-test's `task_xml()` helper, and every name in
+  them is made up. The `--history` example in [Run fate](#run-fate) comes from a stub with those
+  tasks and events. The self-test builds the same stub and checks the rows, but it does not
+  print the table.
+* **The measured results are point-in-time.** The live-versus-XML comparison of the lint, the
+  findings without `--all`, the share of tasks with no time limit and the diff of the two
+  exports were measured once on one machine. Its task set changes, so a rerun can give other
+  numbers. This README leaves the machine's counts out on purpose.
+* **Linux coverage used a virtualenv.** Branch coverage is 100 percent on Windows and on
   Linux. Coverage is not installed for the Linux host's system `python3`, so the Linux
-  measurement ran on a uv-managed Python 3.12.
+  measurement ran in a virtualenv of that same Python 3.12.3.
 * **The quoted self-test run is an excerpt.** Each `...` stands for `PASS` lines left out. Every
   line shown appears in a real run, in that order, and the footer count is the full count.
 * **Application exit codes are opaque.** The OS message table only knows OS codes. A task whose
@@ -789,9 +1152,11 @@ Error, because only the machine knows whether `D:` is a disk or a mapping.
   no task needing attention prints `[]`, the same as a clean run, and exits `1`. In the table
   format the same run prints `No tasks need attention.` on stdout and the failure on stderr.
   Its `--out` file is the same as the file of a clean run.
-* **Python 3.9 reads only some timestamp precisions.** On 3.9 a timestamp with 1, 2, 4 or 5
-  fractional digits is read as having no time. PowerShell's round-trip format always writes
-  7, so real input is not affected.
+* **Python 3.9 reads only some timestamp shapes.** On 3.9 a timestamp with 1, 2, 4 or 5
+  fractional digits, a `+HHMM` offset or a `+HH` offset is read as having no time. 3.12 and
+  3.13 accept them, so a `trigger-expired` finding can differ by Python version on a hand-edited
+  export. PowerShell's round-trip format always writes 7 digits, and Task Scheduler's own
+  formats parse everywhere.
 * **The self-test needs hard links in its temporary folder.** On a FAT or exFAT temporary
   folder, `os.link` fails, and the self-test stops with an `OSError` instead of a count.
 * **Two encodings are refused.** An export in UTF-16 big-endian with no byte order mark, or in
@@ -813,10 +1178,65 @@ Error, because only the machine knows whether `D:` is a disk or a mapping.
   installation with another display language. This was not tested.
 * **Put the path directly after `--lint`.** `taskpulse --lint --all file.xml` reads `file.xml`
   as an unrecognised argument and exits `64`. Write `taskpulse --lint file.xml --all`.
-* **A password in the program field is printed.** Only the arguments pass through the
-  secret-switch filter. A hand-built action whose program field is `sync.exe --password x`
-  prints that text in the health report's `target` field and in the `bare-program` lint
-  detail. The Task Scheduler console and `schtasks /tr` both put arguments in their own field.
+* **A program field with no space is printed as written.** A field that holds a command line,
+  such as `sync.exe --password x`, is masked in the health report's `target` field and in the
+  `bare-program` lint detail, by the rules of the diff's argument mask. The Task Scheduler
+  console and `schtasks /tr` both put arguments in their own field.
+* **Exported XML under `\Microsoft\` is skipped unless `--all` is given.** `--lint PATH` and
+  `--diff` say on stderr how many tasks they skipped, and exit `1` when none was left. A file
+  that holds other tasks too prints a clean result for those alone.
+* **A task with no enabled trigger is not reported.** Disabled triggers are ignored by design,
+  so a task whose only trigger is disabled lints clean.
+* **The `no-time-limit` check reads only `Settings/ExecutionTimeLimit`.** A trigger-level
+  `ExecutionTimeLimit` that bounds the run is not considered, so the Warning can be wrong.
+* **A non-path argument that contains a slash reads as a relative path.** A date such as
+  `2026/01/01` or a ratio such as `10/12`, on a task with an empty `Start In`, gives a false
+  `start-in-missing` Error and exit `2`.
+* **A PowerShell script block that changes folder is not seen.** The body
+  `-Command "& { Set-Location C:\jobs; .\x.ps1 }"` gives a false `start-in-missing` Error.
+* **`--diff` does not compare a principal's `RequiredPrivileges` or `ProcessTokenSidType`**, or
+  anything under `RegistrationInfo`.
+* **Printed text is not cleaned.** A newline inside a task's `Start In` or another printed field
+  breaks the table layout and can forge an extra row, such as an `OK` line. Treat the table as
+  untrusted text and use `--format json` or `csv` for automation.
+* **Hostile XML ends in a plain error.** XML nested about 1500 levels deep ends with
+  `maximum recursion depth exceeded` and exit `1`, with no file name in the message. A DOCTYPE
+  with entities is refused as not well-formed, so entity expansion is not possible.
+* **An export file has no size cap.** Each file is read whole into memory, so a very large file
+  in a linted folder can exhaust memory. Symbolic-link subfolders are refused, but a symbolic
+  link to a file inside a linted folder is read like any file.
+* **The diff reads exports, not the live scheduler.** The live read does not return every trigger
+  field, action field and setting, so `--diff` takes two paths. To compare today with a past
+  day, export today (`schtasks /query /xml ONE > today.xml`) and keep the earlier file.
+* **The diff matches names, and a rename is not a move.** Two files that define the same task
+  collide: the later one wins, and the diff does not say so. A task renamed between exports is
+  one removed and one added task, not a change.
+* **The diff does not normalise values it cannot prove equal.** `PT72H` and `P3D` are the same
+  limit, and they are two values to the diff. Triggers compare without regard to case, so a
+  trigger whose only change is the case of a text value is no change. A run level that one
+  export writes out and the other leaves out reads as a change, because Microsoft documents
+  no default for it. The same holds for any `Settings` element that has no default in the
+  schema.
+* **The argument mask is a set of patterns.** It masks a secret switch by its name, and `-P`
+  and `-p` by their letter. These secrets still print in full: `--pswd X`, `--sas X`,
+  `--sig X`, `--pat X`, `--login user:X`, `/RP X`, `-RP X`, `-EncodedCommand X`, a JSON body
+  such as `--data {"password":"X"}`, the attached form `-pX`, and the `Basic` or `Bearer`
+  token of an `Authorization:` header. The csv and json diff output and any `--out` file are
+  redacted no further than the table. The self-test pins what the mask hides, not what it
+  cannot see. Review a diff before it leaves the machine, as with the rest of the output.
+* **`trigger-expired` does not know the time zone.** A time with no offset is the machine's
+  local time, and an export does not say which. A trigger counts as ended a day after its end,
+  so a zone cannot change the answer, and a trigger that ended an hour ago is not reported yet.
+  The check also cannot see a task that deletes itself after it expires.
+* **`run-conditions` and `logon-minority` are judgments.** The first reports a setting, not a
+  skipped run: a machine that is idle at the trigger time is fine. The second compares a task
+  with the tasks beside it, and a task that differs on purpose is reported. Both are Warnings
+  for that reason. The idle and network conditions' own sub-settings (`IdleSettings`,
+  `NetworkSettings`) are not read by the lint.
+* **A `StartWhenAvailable` check is left out.** The setting is off by default on every task,
+  so a lint on it would be a Warning on nearly every scheduled task. `--history` reports the
+  consequence instead: a start that was missed and not made up is event `153`, and leaves the
+  task `BLOCKED` if nothing has run since.
 * **There is no network path**, so there is nothing to test against a stub server.
 
 ## Contributing
