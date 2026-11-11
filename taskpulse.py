@@ -197,6 +197,12 @@ SECRET_SWITCH = re.compile(
 # printed password costs a lot. curl's -k takes no value, so the word after it is masked for
 # nothing, which costs the same nothing.
 MASKED_LETTERS = frozenset(["p", "P", "k"])
+# Whole switch names, with no secret word in them, that carry a secret often enough to mask under
+# --diff --show-args. Kept apart from SECRET_SWITCH on purpose: that one also decides which
+# values the lint skips as paths, and a name this short would hide a real path from it.
+MASKED_NAMES = re.compile(
+    r"^(?:pin|otp|cookies?|sid|session(?:[-_]?id)?|jwt|dsn|api|conn|conn(?:ection)?[-_]?"
+    r"(?:str|string))$", re.IGNORECASE)
 # The value of a JSON member whose name says it holds a secret, such as {"password":"x"}. The
 # quotes may be backslash-escaped. The name part is bounded so a long word cannot make it slow.
 JSON_SECRET = re.compile(
@@ -548,8 +554,9 @@ def parse_dt(value):
     if not text:
         return None
     # PowerShell's round-trip format emits 7 fractional digits; fromisoformat only
-    # accepts 3 or 6 before Python 3.11, so truncate rather than fail the parse.
-    text = re.sub(r"(\.\d{6})\d+", r"\1", text.replace("Z", "+00:00"))
+    # accepts 3 or 6 before Python 3.11, so cut or pad the fraction to exactly 6.
+    text = re.sub(r"\.(\d+)", lambda m: "." + m.group(1)[:6].ljust(6, "0"),
+                  text.replace("Z", "+00:00"))
     try:
         parsed = datetime.fromisoformat(text)
         if parsed.tzinfo is None:
@@ -771,6 +778,10 @@ def health_status(task, now=None):
         return "Running"
     if code in WARNING_CODES:
         return "Warning"
+    # A failed last run is an Error even when a missed or overdue run also shows: the
+    # failure is the stronger fact, and a Warning would exit 0 for a task that is failing.
+    if code is not None and code not in NON_ERROR_CODES:
+        return "Error"
     if missed > 0 or overdue:
         return "Warning"
     # TASK_NO_MORE_RUNS *means* "no next run"; a recurring task whose EndBoundary
@@ -779,9 +790,7 @@ def health_status(task, now=None):
         return "Warning"
     if code is None or code == TASK_NOT_YET_RUN:
         return "NotYetRun"
-    if code in NON_ERROR_CODES:
-        return "Success"
-    return "Error"
+    return "Success"
 
 
 def attention_reason(task, status, now=None):
@@ -1754,7 +1763,8 @@ def mask_word(value, state):
                     and not SECRET_SWITCH.match(name))
         if attached:
             return dashes + name[:1] + "***" + sep + ("***" if value else ""), ""
-        secret = bool(SECRET_SWITCH.search(name)) or name in MASKED_LETTERS
+        secret = (bool(SECRET_SWITCH.search(name)) or name in MASKED_LETTERS
+                  or bool(MASKED_NAMES.match(name)))
         if secret and not value:
             after = "secret"
         if name in CRED_SWITCH:
@@ -2420,6 +2430,13 @@ def self_test():
           "next run in the past is overdue")
     check(health_status(variant(next_run_time="2026-07-27T02:00:00+00:00", state="Running"),
                         now) == "Running", "a long-running task is not overdue")
+    check(health_status(variant(last_task_result=1, number_of_missed_runs=1), now) == "Error"
+          and health_status(variant(last_task_result=1,
+                                    next_run_time="2026-07-27T02:00:00+00:00"), now) == "Error",
+          "a failed last run stays an Error when a missed or overdue run also shows, so the "
+          "exit code is 2  <-- pinned defect")
+    check(health_status(variant(last_task_result=TASK_TERMINATED, number_of_missed_runs=1), now)
+          == "Warning", "a Warning code with a missed run is still a Warning")
     check(health_status(variant(next_run_time=None), now) == "Warning",
           "a daily task with no next run is broken")
     check(health_status(variant(next_run_time=None, trigger_types="Logon"), now) == "Success",
@@ -2457,6 +2474,10 @@ def self_test():
     check(parse_dt("not a date") is None, "unparseable timestamps do not raise")
     check(parse_dt("2026-07-28T12:00:00.0000000Z") == now,
           "powerShell's 7-digit fractional seconds parse (fromisoformat takes 6 pre-3.11)")
+    check(all(parse_dt("2026-07-28T12:00:00.%sZ" % digits) == now
+              for digits in ("0", "00", "0000", "00000")),
+          "a fraction of 1, 2, 4 or 5 digits parses too, not only 3, 6 or 7 as before 3.11 "
+          "did  <-- pinned defect")
     check(parse_dt("2026-07-28T07:00:00-05:00") == now, "offsets convert to UTC")
     check(health_status(variant(next_run_time="2026-07-29T02:00:00.0000000Z"), now)
           == "Success", "a real PowerShell timestamp is not mistaken for a missing next run")
@@ -4262,6 +4283,15 @@ def self_test():
           and mask_arguments("https://host/api@c") == "https://host/api@c",
           "the password in a URL is masked, wherever the URL sits, and a URL with no password is "
           "not touched  <-- pinned defect")
+    check(all("Hunter2" not in mask_arguments("%s Hunter2 --keep" % flag, "python")
+              and "--keep" in mask_arguments("%s Hunter2 --keep" % flag, "python")
+              for flag in ("--pin", "--cookie", "--otp", "--api", "--sid", "--session-id",
+                           "--jwt", "--dsn", "--connection-string", "--conn"))
+          and "Hunter2" not in mask_arguments("--pin=Hunter2", "python")
+          and mask_arguments(r"--pinned-file x.cfg --session-dir C:\s", "python")
+          == r"--pinned-file x.cfg --session-dir C:\s",
+          "a secret after a bare switch such as --pin, --cookie, --otp or --dsn is masked and "
+          "the next switch is kept, while a longer name is not  <-- pinned defect")
     check(mask_arguments(r"use \\srv\share Pa55word", "net") == "***"
           and mask_arguments("", "net") == "",
           "every argument of net is masked: it takes its password by position")

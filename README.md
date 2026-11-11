@@ -197,10 +197,10 @@ PASS  importing taskpulse runs nothing and prints nothing
 PASS  the import probe writes no .pyc beside the script  <-- pinned defect
 os message table: present
 --------------------------------------------------------------------
-717 assertions, 0 failed
+721 assertions, 0 failed
 ```
 
-The same command prints `717 assertions, 0 failed` on Windows with Python 3.13, 3.12 and 3.9, and
+The same command prints `721 assertions, 0 failed` on Windows with Python 3.13, 3.12 and 3.9, and
 on Ubuntu with Python 3.12. On Linux there is no OS message table, so the line above the footer
 rule reads `os message table: absent, so its assertions check the unmapped fallback`. Six
 assertions then check the `unmapped result 0x...` text instead of the Windows wording, and the
@@ -319,7 +319,7 @@ cd taskpulse
 python taskpulse.py --self-test
 ```
 
-That is the whole setup. `--self-test` runs 717 assertions with no network, no credentials and
+That is the whole setup. `--self-test` runs 721 assertions with no network, no credentials and
 no Task Scheduler access, so it passes on a locked-down box. Then run
 `python taskpulse.py` for the health report, `python taskpulse.py --lint` for the lint, or
 `python taskpulse.py --diff old.xml new.xml` to compare two exports.
@@ -973,9 +973,11 @@ apart gets ignored the first night it reports one.
   rest is the self-test's stub. The link between the `IgnoreNew` policy and event `322` rests
   on Microsoft's wording for both, which the README quotes, and not on a measured run.
 * **Five events from the manifest are not read.** `202` (action failed to complete), `328`
-  (stopped because the computer is no longer idle), `331` (failed to stop on timeout) and `333`
-  and `334` (launch refused in a RemoteApp or worker session) are not in the filter. A run that
-  one of them ends without a `201` reads as `Running` or `Unknown`.
+  (stopped because the computer is no longer idle) and `333` and `334` (launch refused in a
+  RemoteApp or worker session) are not in the filter. A run that one of them ends without a
+  `201` reads as `Running` or `Unknown`. Event `331` (`TimeoutWontWork`) is not read either, but
+  it does not end a run: the timeout mechanism failed and the run continues, per the provider
+  manifest (`Get-WinEvent -ListProvider Microsoft-Windows-TaskScheduler`).
 * **Two more events from the manifest are not read, and one of them is a refused launch.**
   Event `135` (`NoStartWithoutIdle`, "could not start because the machine was not idle") is
   refused like `153` and `332`, and event `150` is a failed event-trigger subscription. A
@@ -1359,7 +1361,7 @@ apart gets ignored the first night it reports one.
 * **There is no network path**, so there is nothing to test against a stub server.
 * **Mutation survivors are test gaps, not wrong output today.** A sweep of 1839 mutants of the
   non-test code (a flipped comparison, an `and`/`or` swap, a dropped branch, a constant moved by
-  one, a swapped severity or state string) was run against the self-test at 680 assertions, a count that has since grown to 717. It
+  one, a swapped severity or state string) was run against the self-test at 680 assertions, a count that has since grown to 721. It
   killed 1716, and 123 survived. Most survivors are equivalent mutants or unused constants. Six
   gaps were real, and none gave a wrong output. After the sweep the self-test pinned the detail
   text of the Running-state `STUCK` rule and three boundaries: a refusal at exactly the 7-day
@@ -1422,13 +1424,14 @@ apart gets ignored the first night it reports one.
   finding cannot tell the path from a value that holds a secret.
 * **`--show-args` masks by switch name and shape.** A password passed by position after a script
   (`cmd /c run.bat X`), inside an inline `-Command` string, or after a switch whose name holds no
-  secret word (`-ConnectionString "X"`) prints. The default diff never prints arguments.
+  secret word (`-ConnectionString "X"`) prints. The bare names `--pin`, `--otp`, `--cookie`,
+  `--sid`, `--session`, `--session-id`, `--jwt`, `--dsn`, `--api`, `--conn` and `--connection-string`
+  are masked as secret switches, but only as the whole name, so `--pinned-file` is not. The default diff never prints arguments.
 * **The busy-log numbers come from one observation.** The figures of about 700 to 1000 events
   a day come from a single server, were seen once and were not reproduced.
 * **A bare positional secret prints in full in `--diff --show-args`.** In `x.py SECRET` nothing in the XML
   says that the word is a secret. The mask also leaves these forms: a value after a switch
-  with a neutral name (`--cookie X`, `--session X`, `--jwt X`, `--pin X`, `--otp X`, `--dsn X`,
-  `--connection-string X`, `-ArgumentList X`), a literal in a PowerShell `-Command` body such
+  with a neutral name (`-ArgumentList X`, `--refresh X`), a literal in a PowerShell `-Command` body such
   as `$p = 'X'`, a literal in parentheses after a secret switch such as
   `-Password (ConvertTo-SecureString 'X' -AsPlainText)`, the Oracle form `user/password@db`,
   the value of `-SecureString` and of any one-letter switch other than `-p`, `-P` and `-k`,
@@ -1478,7 +1481,7 @@ apart gets ignored the first night it reports one.
   its first `.exe`, `.bat`, `.cmd` or `.com`. A program with no space that looks like a secret,
   such as `=HYPERLINK(1)`, prints as `***` in the `--diff` action row.
 * **The mask knows switch names, not secrets.** With `--show-args`, any value after a switch
-  with a neutral name (`--refresh X`, `--sessionid X`, `--header X-Foo:X`), a token in a URL
+  with a neutral name (`--refresh X`, `--header X-Foo:X`), a token in a URL
   path, a user in `https://X@host` and a positional word after a `.ps1` or `.bat` prints.
 * **A secret in single-quoted text in a command body prints with `--show-args`.** That covers
   `{'password': 'X'}` and a hashtable. In a double-quoted JSON member, a value with an escaped
@@ -1493,6 +1496,34 @@ apart gets ignored the first night it reports one.
   Delete it by hand.
 * **Importing taskpulse as a module writes `__pycache__` beside it.** The folder is
   git-ignored. Do not run `git add -A` without the `.gitignore`.
+* **The logon-type findings follow Microsoft's page, and some facts are uncited.** S4U, interactive
+  and service-account logon behaviour follows Microsoft's
+  [`TASK_LOGON_TYPE` page](https://learn.microsoft.com/en-us/windows/win32/api/taskschd/ne-taskschd-task_logon_type):
+  S4U has "no access to either the network or to encrypted files", and `INTERACTIVE_TOKEN` means
+  the "User must already be logged on". The README cites no page for LOCAL SERVICE having
+  anonymous network access while NETWORK SERVICE uses the computer account, or for a mapped drive
+  being absent in a non-interactive session.
+* **A reader cannot rerun the example output blocks.** The example outputs come from synthetic
+  files that are not shipped. The self-test pins the same rows rather than printing these tables.
+* **Table cells are cut, so a long reason can end mid-word.** The table cuts health cells at 60
+  characters and lint and diff cells at 240. The `WHY` text of a `STUCK` row can end mid-word.
+  Use `--format json` for the full text.
+* **The self-test and the README measurements assume English Windows message text.** A
+  non-English Windows install is expected to fail the OS-message assertions. This is untested.
+* **`--diff --show-args` leaves `-ArgumentList --pass,X` unmasked.** A 52-shape sweep found this
+  one leak. The default diff and lint output printed no secret in that sweep.
+* **A control character in a live task name or author prints unchanged.** An exported XML file
+  cannot carry one, because the XML parser rejects it, but the live read prints it to the terminal.
+* **A mistyped flag echoes its value.** argparse repeats an unrecognised argument on stderr, so
+  `--password X` prints `X` in the usage error.
+* **A CSV report has no byte-order mark.** `--apply` writes UTF-8 without one, so Excel can show
+  non-ASCII task names wrongly until the file is imported as UTF-8. The formula guard checks only
+  the first character of a cell, so a cell that starts with a space before a formula is written
+  as it is.
+* **An unreadable path can end `--out` checks with a traceback.** A stat failure on a path that
+  exists but cannot be read makes `inside()` stop with exit `1`, not a usage error with exit `64`.
+  A `--lint` of a single file also lets `--out` name a new file in the same folder. A later folder
+  lint of that folder then stops with "no <Task> element found" and exit `1`, never a false clean.
 
 ## Contributing
 
