@@ -1452,7 +1452,7 @@ def lint_task(task, local_drives=("C",), now=None):
             relative = relative_paths(exe, args)
             # A value that only looks like a path, such as a password with a '/', can be a
             # secret, so only a value with a known extension is printed.
-            shown = [value if extension_of(value) in NAMED_EXTS
+            shown = [shown_program(value) if extension_of(value) in NAMED_EXTS
                      else "(a value with no file extension, not printed)" for value in relative]
             if relative:
                 add("Error", "start-in-missing",
@@ -3612,6 +3612,15 @@ def self_test():
           == (r"C:\Program Files\x\y.exe", "Executable"),
           "a secret in the Command field is masked in the lint finding and in the target, and "
           "a path with spaces is not touched  <-- pinned defect")
+    for cmdline in ("sync.exe --password Hunt3rZZ9 out.csv", "python.exe --token Hunt3rZZ9 etl.py",
+                    "tools\\sync.exe --password Hunt3rZZ9 report.log"):
+        ending = lint_task(job(command=cmdline, arguments="", start=""))
+        check(any(f["check"] == "start-in-missing" for f in ending)
+              and all("Hunt3rZZ9" not in f["detail"] for f in ending)
+              and any("--password ***" in f["detail"] or "--token ***" in f["detail"]
+                      for f in ending),
+              "a command line in Command that ends in a known extension is masked in the "
+              "start-in-missing finding: %s  <-- pinned defect" % cmdline.split()[0])
     single = job(start="jobs")
     single["actions"] = single["actions"][0]
     check(finding_checks(single) == [("Error", "start-in-relative")],

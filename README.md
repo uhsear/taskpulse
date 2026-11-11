@@ -197,10 +197,10 @@ PASS  importing taskpulse runs nothing and prints nothing
 PASS  the import probe writes no .pyc beside the script  <-- pinned defect
 os message table: present
 --------------------------------------------------------------------
-713 assertions, 0 failed
+716 assertions, 0 failed
 ```
 
-The same command prints `713 assertions, 0 failed` on Windows with Python 3.13, 3.12 and 3.9, and
+The same command prints `716 assertions, 0 failed` on Windows with Python 3.13, 3.12 and 3.9, and
 on Ubuntu with Python 3.12. On Linux there is no OS message table, so the line above the footer
 rule reads `os message table: absent, so its assertions check the unmapped fallback`. Six
 assertions then check the `unmapped result 0x...` text instead of the Windows wording, and the
@@ -319,7 +319,7 @@ cd taskpulse
 python taskpulse.py --self-test
 ```
 
-That is the whole setup. `--self-test` runs 713 assertions with no network, no credentials and
+That is the whole setup. `--self-test` runs 716 assertions with no network, no credentials and
 no Task Scheduler access, so it passes on a locked-down box. Then run
 `python taskpulse.py` for the health report, `python taskpulse.py --lint` for the lint, or
 `python taskpulse.py --diff old.xml new.xml` to compare two exports.
@@ -1252,7 +1252,11 @@ apart gets ignored the first night it reports one.
 * **A program field with no space is printed as written.** A field that holds a command line,
   such as `sync.exe --password x`, is masked in the health report's `target` field and in the
   `bare-program` lint detail, by the rules of the diff's argument mask. The Task Scheduler
-  console and `schtasks /tr` both put arguments in their own field.
+  console and `schtasks /tr` both put arguments in their own field. A Command that holds spaces
+  is judged as one program path, so its `Start In` findings read oddly. A program path with a
+  space and a `+` or `=` in it, such as `C:\Program Files\Notepad++\notepad++.exe`, can print
+  as `C:\Program ***` in the health `target` and the diff action row, because the mask reads
+  that word as a secret. The verdict is not affected.
 * **Exported XML under `\Microsoft\` is skipped unless `--all` is given.** `--lint PATH` and
   `--diff` say on stderr how many tasks they skipped, and exit `1` when none was left. A file
   that holds other tasks too prints a clean result for those alone.
@@ -1343,7 +1347,7 @@ apart gets ignored the first night it reports one.
 * **There is no network path**, so there is nothing to test against a stub server.
 * **Mutation survivors are test gaps, not wrong output today.** A sweep of 1839 mutants of the
   non-test code (a flipped comparison, an `and`/`or` swap, a dropped branch, a constant moved by
-  one, a swapped severity or state string) was run against the self-test at 680 assertions, a count that has since grown to 713. It
+  one, a swapped severity or state string) was run against the self-test at 680 assertions, a count that has since grown to 716. It
   killed 1716, and 123 survived. Most survivors are equivalent mutants or unused constants. Six
   gaps were real, and none gave a wrong output. After the sweep the self-test pinned the detail
   text of the Running-state `STUCK` rule and three boundaries: a refusal at exactly the 7-day
@@ -1396,6 +1400,16 @@ apart gets ignored the first night it reports one.
 * **A task meant to run for ever is STUCK.** A daemon that starts at logon or at startup is
   reported STUCK after `--stuck-hours` and stays STUCK. The only way to exclude one is a
   `--match` regex.
+* **`--match` is the caller's own regex.** taskpulse does not bound it, so a pattern with
+  catastrophic backtracking can run for a long time.
+* **A change from a group principal to `InteractiveToken` is not reported in `--diff`,** because
+  both read as interactive.
+* **A secret-looking folder name in a relative path prints when the path ends in a known
+  extension.** `relative/Hunt3rZZ9/x.exe` prints in a `start-in-missing` finding, because the
+  finding cannot tell the path from a value that holds a secret.
+* **`--show-args` masks by switch name and shape.** A password passed by position after a script
+  (`cmd /c run.bat X`), inside an inline `-Command` string, or after a switch whose name holds no
+  secret word (`-ConnectionString "X"`) prints. The default diff never prints arguments.
 * **The busy-log numbers come from one observation.** The figures of about 700 to 1000 events
   a day come from a single server, were seen once and were not reproduced.
 * **A bare positional secret prints in full in `--diff --show-args`.** In `x.py SECRET` nothing in the XML
