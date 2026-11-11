@@ -188,6 +188,8 @@ PASS  --out on an export that --diff compares is refused and the export is untou
 PASS  --diff takes exactly two paths, cannot be combined with --lint or --history, and cannot be typed as a prefix  <-- pinned defect
 PASS  a mistyped or invalid flag value is never echoed on stderr, only the flag name  <-- pinned defect
 ...
+PASS  no flag value reaches stderr in a short flag, a dash-led value, a flag that takes none, an abbreviated flag or a bad choice  <-- pinned defect
+...
 PASS  --history 0 or less, which matches no event, and --since-record-id without --history or below 0 are usage errors, not an empty history  <-- pinned defect
 PASS  --history below 7 days is a usage error: a shorter read would still label its columns 'the last 7 days'  <-- pinned defect
 ...
@@ -198,10 +200,10 @@ PASS  importing taskpulse runs nothing and prints nothing
 PASS  the import probe writes no .pyc beside the script  <-- pinned defect
 os message table: present
 --------------------------------------------------------------------
-722 assertions, 0 failed
+723 assertions, 0 failed
 ```
 
-The same command prints `722 assertions, 0 failed` on Windows with Python 3.13, 3.12 and 3.9, and
+The same command prints `723 assertions, 0 failed` on Windows with Python 3.13, 3.12 and 3.9, and
 on Ubuntu with Python 3.12. On Linux there is no OS message table, so the line above the footer
 rule reads `os message table: absent, so its assertions check the unmapped fallback`. Six
 assertions then check the `unmapped result 0x...` text instead of the Windows wording, and the
@@ -321,7 +323,7 @@ cd taskpulse
 python taskpulse.py --self-test
 ```
 
-That is the whole setup. `--self-test` runs 722 assertions with no network, no credentials and
+That is the whole setup. `--self-test` runs 723 assertions with no network, no credentials and
 no Task Scheduler access, so it passes on a locked-down box. Then run
 `python taskpulse.py` for the health report, `python taskpulse.py --lint` for the lint, or
 `python taskpulse.py --diff old.xml new.xml` to compare two exports.
@@ -1146,9 +1148,8 @@ apart gets ignored the first night it reports one.
   numbers. This README gives those counts as words, not numbers.
 * **Linux coverage used a virtualenv.** Branch coverage is 100 percent on Windows and on
   Linux. Coverage is not installed for the Linux host's system `python3`, so the Linux
-  measurement ran in a virtualenv of that same Python 3.12.3. Windows used coverage's C tracer
-  and Linux its pure-Python tracer. Coverage was not measured on Python 3.9, although the
-  self-test ran green there.
+  measurement ran in a virtualenv of that same Python 3.12.3. Both runs used coverage's C
+  extension. Coverage was not measured on Python 3.9, although the self-test ran green there.
 * **The quoted self-test run is an excerpt.** Each `...` stands for `PASS` lines left out. Every
   line shown appears in a real run, in that order, and the footer count is the full count.
 * **Application exit codes are opaque.** The OS message table only knows OS codes. A task whose
@@ -1368,7 +1369,7 @@ apart gets ignored the first night it reports one.
 * **There is no network path**, so there is nothing to test against a stub server.
 * **Mutation survivors are test gaps, not wrong output today.** A sweep of 1839 mutants of the
   non-test code (a flipped comparison, an `and`/`or` swap, a dropped branch, a constant moved by
-  one, a swapped severity or state string) was run against the self-test at 680 assertions, a count that has since grown to 722. It
+  one, a swapped severity or state string) was run against the self-test at 680 assertions, a count that has since grown to 723. It
   killed 1716, and 123 survived. Most survivors are equivalent mutants or unused constants. Six
   gaps were real, and none gave a wrong output. After the sweep the self-test pinned the detail
   text of the Running-state `STUCK` rule and three boundaries: a refusal at exactly the 7-day
@@ -1531,9 +1532,17 @@ apart gets ignored the first night it reports one.
   one leak. The default diff and lint output printed no secret in that sweep.
 * **A control character in a live task name or author prints unchanged.** An exported XML file
   cannot carry one, because the XML parser rejects it, but the live read prints it to the terminal.
-* **A mistyped flag does not echo its value.** The usage error names the flag, such as
-  `--password`, and the count of arguments. It never repeats a value, also not an invalid
-  `--timeout` or `--format` value. The self-test pins this with a fake password.
+* **A mistyped flag does not echo its value.** The usage error names a long flag, such as
+  `--password`, and the count of arguments. It prints a short flag, such as `-pSECRET`, as
+  `-<hidden>`, and it hides the value of a flag that takes none, such as `--apply=SECRET`, and an
+  invalid `--timeout` or `--format` value. The self-test pins these shapes with a fake password.
+  A path you pass to `--lint`, `--diff` or `--out` is echoed in the error that names it, so do
+  not put a secret in a path.
+* **`--local-drives` is checked only with `--lint`.** It is accepted and ignored without
+  `--lint`, and a value such as `12,%` is accepted and makes every `C:` path a mapped-drive
+  Warning.
+* **The no-network claim covers taskpulse's own code.** A UNC path such as
+  `\\server\share\x.xml` given to `--lint` or `--diff` is read over SMB by Windows.
 * **A CSV report has no byte-order mark.** `--apply` writes UTF-8 without one, so Excel can show
   non-ASCII task names wrongly until the file is imported as UTF-8. The formula guard checks only
   the first character of a cell, so a cell that starts with a space before a formula is written

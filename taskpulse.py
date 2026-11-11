@@ -4981,6 +4981,17 @@ def self_test():
                   and "invalid" in leaks[2][2],
                   "a mistyped or invalid flag value is never echoed on stderr, only the flag "
                   "name  <-- pinned defect")
+            shapes = (("-pHunter2",), ("-uadmin:Hunter2",), ("--password", "-Hunter2"),
+                      ("--all=Hunter2",), ("--show-ok=Hunter2",), ("--apply=Hunter2",),
+                      ("--show-args=Hunter2",), ("--self-test=Hunter2",), ("--version=Hunter2",),
+                      ("-h=Hunter2",), ("--ap=Hunter2",), ("--bogus=Hunter2",),
+                      ("--format=Hunter2",), ("--format=a'b\"Hunter2",),
+                      ("--timeout=a'b\"Hunter2",), ("--history=Hunter2",))
+            leaks = [cli(*argv) for argv in shapes]
+            check([code for code, _, _ in leaks] == [64] * len(shapes)
+                  and not any("Hunter2" in out + err for _, out, err in leaks),
+                  "no flag value reaches stderr in a short flag, a dash-led value, a flag that "
+                  "takes none, an abbreviated flag or a bad choice  <-- pinned defect")
             usage = [cli(*argv)[0] for argv in (("--bogus",), ("--timeout", "abc"),
                                                 ("--format", "xml"), ("--history", "x"))]
             check(usage == [64] * 4,
@@ -5147,16 +5158,19 @@ class Parser(argparse.ArgumentParser):
     """argparse exits 2 on a usage error, and 2 here means an Error finding. Use 64 instead."""
 
     def error(self, message):
-        # A mistyped secret flag (--password X) or value would otherwise be echoed to stderr,
-        # which a monitoring check logs. Keep the flag names, drop every value.
+        # A mistyped secret flag (--password X, -pX, --apply=X) or value would otherwise be
+        # echoed to stderr, which a monitoring check logs. Keep long flag names, drop every value.
         message = re.sub(
             r"^unrecognized arguments: (.*)$",
             lambda hit: "unrecognized arguments: %s (%d in all, values not echoed)" % (
-                " ".join(word.split("=")[0] for word in hit.group(1).split()
-                         if word.startswith("-")), len(hit.group(1).split())),
-            message)
-        message = re.sub(r"(invalid [\w ]*?value: |invalid choice: )'.*?'", r"\1<hidden>",
-                         message)
+                " ".join(re.split(r"[=:]", word)[0] if word.startswith("--") else "-<hidden>"
+                         for word in hit.group(1).split() if word.startswith("-")),
+                len(hit.group(1).split())),
+            message, flags=re.S)
+        message = re.sub(r"(ignored explicit argument ).*", r"\1<hidden>", message, flags=re.S)
+        message = re.sub(r"(invalid choice: ).*( \(choose from )", r"\1<hidden>\2", message,
+                         flags=re.S)
+        message = re.sub(r"(invalid [\w ]*?value: ).*", r"\1<hidden>", message, flags=re.S)
         self.print_usage(sys.stderr)
         self.exit(USAGE_ERROR, "%s: error: %s\n" % (self.prog, message))
 
