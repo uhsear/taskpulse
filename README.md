@@ -103,7 +103,7 @@ PASS  a Set-Location to a relative folder resolves against System32 itself  <-- 
 ...
 PASS  a quote opens in the middle of a word, an apostrophe inside a name does not, and an unclosed quote is closed at the end of the line  <-- pinned defect
 ...
-PASS  a secret in the Command field is masked in the lint finding and in the target, and a path with spaces is not touched  <-- pinned defect
+PASS  a command line in the Command field prints up to its program in the lint finding and in the target, and a path with spaces is not touched  <-- pinned defect
 ...
 PASS  utf-8 bytes whose declaration still says UTF-16 parse  <-- pinned defect
 ...
@@ -121,10 +121,10 @@ PASS  a setting written out at its default, in any case, equals one left out  <-
 ...
 PASS  a task that gains DeleteExpiredTaskAfter PT0S is a change: Microsoft says an absent element means the task is never deleted, and PT0S deletes it at once  <-- pinned defect
 ...
+PASS  one instant written with a summer and a winter offset is no change, and the same wall clock at another offset is a change  <-- pinned defect
 PASS  a monthly trigger that moves one of its repeated Day or Week values is a change; the last value kept used to hide it  <-- pinned defect
 PASS  a timestamp past the last UTC instant is None, not an OverflowError  <-- pinned defect
 ...
-PASS  one instant written with a summer and a winter offset is no change, and the same wall clock at another offset is a change  <-- pinned defect
 PASS  by default the arguments are compared but not printed, and a changed one says so  <-- pinned defect
 ...
 PASS  a logon change on a task that runs ArcGIS Pro's Python also names the licence conditions  <-- pinned defect
@@ -197,10 +197,10 @@ PASS  importing taskpulse runs nothing and prints nothing
 PASS  the import probe writes no .pyc beside the script  <-- pinned defect
 os message table: present
 --------------------------------------------------------------------
-716 assertions, 0 failed
+717 assertions, 0 failed
 ```
 
-The same command prints `716 assertions, 0 failed` on Windows with Python 3.13, 3.12 and 3.9, and
+The same command prints `717 assertions, 0 failed` on Windows with Python 3.13, 3.12 and 3.9, and
 on Ubuntu with Python 3.12. On Linux there is no OS message table, so the line above the footer
 rule reads `os message table: absent, so its assertions check the unmapped fallback`. Six
 assertions then check the `unmapped result 0x...` text instead of the Windows wording, and the
@@ -319,7 +319,7 @@ cd taskpulse
 python taskpulse.py --self-test
 ```
 
-That is the whole setup. `--self-test` runs 716 assertions with no network, no credentials and
+That is the whole setup. `--self-test` runs 717 assertions with no network, no credentials and
 no Task Scheduler access, so it passes on a locked-down box. Then run
 `python taskpulse.py` for the health report, `python taskpulse.py --lint` for the lint, or
 `python taskpulse.py --diff old.xml new.xml` to compare two exports.
@@ -409,7 +409,7 @@ these checks. A finding is an `Error` when the next run cannot work as configure
 | `bare-program` | Warning | The program has no folder, such as `python.exe`, and is not one of the Windows programs that are on every account's `PATH`. |
 | `no-time-limit` | Warning | `ExecutionTimeLimit` is zero (`PT0S`, "run indefinitely") and `MultipleInstancesPolicy` is not `StopExisting`. A hung run never ends. Under the default policy, `IgnoreNew`, every later launch is dropped without an error, and under `Queue` they wait behind it. Under `Parallel` they pile up beside it. Only `IgnoreNew` drops launches, so only its finding names event `322` ("Launch request ignored, instance already running"), which `--history` reads. |
 | `run-conditions` | Warning | `RunOnlyIfIdle` or `RunOnlyIfNetworkAvailable` is true. The task is set to run only while the computer is idle, or only while a network is available, so a trigger that fires while that is false can leave the run unstarted, and `Last Run Result` still shows the previous run. |
-| `trigger-expired` | Warning | Every enabled trigger has an `EndBoundary` more than a day in the past, so no trigger can start the task again. Task Scheduler reports `0x00041304` ("no more runs"), which the health report counts as a non-error. A time with no zone is the machine's local time, which an export does not say, so a trigger counts as ended only a day after its end. |
+| `trigger-expired` | Warning | Every enabled trigger has an `EndBoundary` more than a day in the past, so no trigger can start the task again. Task Scheduler reports `0x00041304` (`SCHED_S_TASK_NO_MORE_RUNS`, "no more runs"; see [Microsoft's constants page](https://learn.microsoft.com/en-us/windows/win32/taskschd/task-scheduler-error-and-success-constants)), which the health report counts as a non-error. A time with no zone is the machine's local time, which an export does not say, so a trigger counts as ended only a day after its end. |
 | `logon-minority` | Warning | The task's logon type differs from its neighbours. Neighbours are the enabled tasks in the same folder that run as the same account. The type has to be shared by two or more of them, and by more than any other type, so a tie names nobody. A heuristic: a task can differ on purpose. |
 | `read-failed` | Warning | The live read could not get the task's actions, triggers or run details, so the other checks may have missed a finding. An exported XML task never gets it. |
 
@@ -541,8 +541,9 @@ the task". `PT0S` is the opposite: delete the task as soon as it expires. Treati
 element as `PT0S` would hide, from `--diff`, a change that makes a task delete itself. An absent
 element compares as blank, so `--diff` reports the change to `PT0S` (the self-test pins it).
 
-Two more defaults are not applied, because Microsoft documents none. The principal's `LogonType`
-page lists `S4U`, `Password` and `InteractiveToken` and says nothing about an absent one, so an
+Two more defaults are not applied, because Microsoft documents none. The principal's
+[`LogonType` page](https://learn.microsoft.com/en-us/windows/win32/taskschd/taskschedulerschema-logontype-principaltype-element)
+lists `S4U`, `Password` and `InteractiveToken` and says nothing about an absent one, so an
 absent `LogonType` is unknown and no logon check fires on it. The `RunLevel` page lists no
 default either, so `--diff` shows an absent run level as blank.
 
@@ -815,8 +816,11 @@ changed that is not printed)`, so the change is not lost. The self-test greps th
 finds none. It masks 32 more command-line shapes, from `-Password "a b"` to `curl -u
 user:pass`, and checks each one. It also prints seven changes in shapes the mask does not know,
 such as a token in a webhook URL path and `etl.py X`, without `--show-args`, and finds no secret
-in any of the three formats. The program field is masked the same way when it holds a command
-line, as in `sync.exe --password x`.
+in any of the three formats. When the program field holds a whole command line, as in
+`sync.exe --password x`, the default output prints it only up to the first `.exe`, `.bat`,
+`.cmd` or `.com`, followed by `[arguments not shown]`. A field with no such name prints as
+`[command line not shown]`. With `--show-args`, the diff prints the whole field with the mask
+applied, and that output can hold a secret in a shape the mask does not know.
 
 ### The licence note
 
@@ -828,7 +832,8 @@ its command line holds the `ArcGIS\Pro\bin\Python` folder, the `arcgispro-py3` e
 [the default environment is `arcgispro-py3`](https://doc.esri.com/en/arcgis-pro/latest/arcpy/get-started/what-is-conda.html)
 and [`propy` starts Python](https://doc.esri.com/en/arcgis-pro/latest/arcpy/get-started/installing-python-for-arcgis-pro.html).
 
-Esri's page on running Python outside the application says that one of four conditions must
+[Esri's page on running Python outside the application](https://doc.esri.com/en/arcgis-pro/latest/arcpy/get-started/installing-python-for-arcgis-pro.html)
+says that one of four conditions must
 hold, and that otherwise "a RuntimeError: NotInitialized exception appears when importing
 arcpy or arcgisscripting". The four are that "Sign me in automatically" was checked when
 signing in to ArcGIS Pro, that ArcGIS Pro is open, that it has been authorized to work
@@ -869,8 +874,8 @@ account whose password no longer works.
 **Wrapper commands.** Most real tasks run `python.exe C:\jobs\etl.py` or
 `powershell.exe -File C:\jobs\sync.ps1`. A report that prints the `Execute` field tells you
 `python.exe` failed, which is true and useless. taskpulse walks the arguments, skips switches,
-respects `-File`, `-Command`, `-c` and `-m`, and reports `etl.py` as the target. This is the one
-column Task Scheduler genuinely cannot give you.
+respects `-File`, `-Command`, `-c` and `-m`, and reports `etl.py` as the target. This is a column
+the Task Scheduler console does not show.
 
 **Event log rescanning.** The tempting approach is to reconstruct the whole verdict from
 `Microsoft-Windows-TaskScheduler/Operational`. That log is disabled by default on Windows, it
@@ -1128,7 +1133,8 @@ apart gets ignored the first night it reports one.
   blocks. A generator wrote them from the self-test's `task_xml()` helper, and every name in
   them is made up. The `--history` example in [Run fate](#run-fate) comes from a stub with those
   tasks and events. The self-test builds the same stub and checks the rows, but it does not
-  print the table.
+  print the table. The `--lint` example outputs come from synthetic inputs that the repo does not
+  ship either. The self-test checks the same rows.
 * **The measured results are point-in-time.** The live-versus-XML comparison of the lint, the
   findings without `--all`, the share of tasks with no time limit and the diff of the two
   exports were measured once on one machine. Its task set changes, so a rerun can give other
@@ -1250,8 +1256,11 @@ apart gets ignored the first night it reports one.
 * **Put the path directly after `--lint`.** `taskpulse --lint --all file.xml` reads `file.xml`
   as an unrecognised argument and exits `64`. Write `taskpulse --lint file.xml --all`.
 * **A program field with no space is printed as written.** A field that holds a command line,
-  such as `sync.exe --password x`, is masked in the health report's `target` field and in the
-  `bare-program` lint detail, by the rules of the diff's argument mask. The Task Scheduler
+  such as `sync.exe --password x`, prints only up to its first `.exe`, `.bat`, `.cmd` or `.com`
+  in the health report's `target` field, the `bare-program` lint detail and the default `--diff`
+  action row, as `sync.exe [arguments not shown]`. A field with no such name prints as
+  `[command line not shown]`. The part that prints is still passed through the diff's argument
+  mask, and `--diff --show-args` prints the whole field with the mask applied. The Task Scheduler
   console and `schtasks /tr` both put arguments in their own field. A Command that holds spaces
   is judged as one program path, so its `Start In` findings read oddly. A program path with a
   space and a `+` or `=` in it, such as `C:\Program Files\Notepad++\notepad++.exe`, can print
@@ -1271,6 +1280,9 @@ apart gets ignored the first night it reports one.
   `-Command "& { Set-Location C:\jobs; .\x.ps1 }"` gives a false `start-in-missing` Error.
 * **`--diff` does not compare a principal's `RequiredPrivileges` or `ProcessTokenSidType`**, or
   anything under `RegistrationInfo`.
+* **A folder with a file that is not a task stops the run.** A backup, a note or any other file
+  inside the folder gives `no <Task> element found` or `not well-formed` and exit `1`. The run
+  is loud, not clean. Move such files out first.
 * **Printed text is not cleaned.** A newline inside a task's `Start In` or another printed field
   breaks the table layout and can forge an extra row, such as an `OK` line. Treat the table as
   untrusted text and use `--format json` or `csv` for automation.
@@ -1347,7 +1359,7 @@ apart gets ignored the first night it reports one.
 * **There is no network path**, so there is nothing to test against a stub server.
 * **Mutation survivors are test gaps, not wrong output today.** A sweep of 1839 mutants of the
   non-test code (a flipped comparison, an `and`/`or` swap, a dropped branch, a constant moved by
-  one, a swapped severity or state string) was run against the self-test at 680 assertions, a count that has since grown to 716. It
+  one, a swapped severity or state string) was run against the self-test at 680 assertions, a count that has since grown to 717. It
   killed 1716, and 123 survived. Most survivors are equivalent mutants or unused constants. Six
   gaps were real, and none gave a wrong output. After the sweep the self-test pinned the detail
   text of the Running-state `STUCK` rule and three boundaries: a refusal at exactly the 7-day
@@ -1395,7 +1407,8 @@ apart gets ignored the first night it reports one.
   files. Copy the folder by hand and it travels along.
 * **The `WHY` column quotes Windows for the last result.** A run that event `329` ended for
   exceeding its time limit shows the text `The last run of the task was terminated by the
-  user.`, because the status comes from result code `0x41306`. The failure count and the run
+  user.`, because the status comes from result code `0x41306`
+  (`SCHED_S_TASK_TERMINATED` on [Microsoft's constants page](https://learn.microsoft.com/en-us/windows/win32/taskschd/task-scheduler-error-and-success-constants)). The failure count and the run
   status are right.
 * **A task meant to run for ever is STUCK.** A daemon that starts at logon or at startup is
   reported STUCK after `--stuck-hours` and stays STUCK. The only way to exclude one is a
@@ -1459,11 +1472,11 @@ apart gets ignored the first night it reports one.
 * **The event meanings have no Microsoft documentation page.** What each event number means
   was read from the provider manifest and from runs. The `Enable All Tasks History` label is
   the one that the Task Scheduler console shows, and no page was checked for it.
-* **The program field is masked by pattern in every mode.** An unmarked positional word in a
-  `Command` field that holds a whole command line, such as `sync.exe Hq7Zk9`, prints in the
-  health report, the bare-program finding and `--diff`, with or without `--show-args`. A
-  program that looks like a secret, such as `=HYPERLINK(1)`, prints as `***` in the `--diff`
-  action row.
+* **A program field that holds a command line prints with `--show-args` under the mask alone.**
+  An unmarked positional word in a `Command` field, such as `sync.exe Hq7Zk9`, prints in the
+  `--diff` action row with `--show-args`. Without `--show-args`, that field prints only up to
+  its first `.exe`, `.bat`, `.cmd` or `.com`. A program with no space that looks like a secret,
+  such as `=HYPERLINK(1)`, prints as `***` in the `--diff` action row.
 * **The mask knows switch names, not secrets.** With `--show-args`, any value after a switch
   with a neutral name (`--refresh X`, `--sessionid X`, `--header X-Foo:X`), a token in a URL
   path, a user in `https://X@host` and a positional word after a `.ps1` or `.bat` prints.
@@ -1472,9 +1485,10 @@ apart gets ignored the first night it reports one.
   quote, such as `"ab\"cd X"`, is masked only up to the escaped quote, and the rest prints.
 * **An unparenthesized `ConvertTo-SecureString 'X' -AsPlainText` prints with `--show-args`.**
   So do its `-String 'X'` form and the value of `-ArgumentList '--pass','X'`.
-* **Do not read the exit code through a pipe that can close early.** Piping a report into
-  `head -c 100` ends with `BrokenPipeError` and exit code `120` on Windows Python 3.13, which
-  is not `1` or `2`. Write with `--out` and `--apply` instead.
+* **Do not read the exit code through a pipe that can close early.** A pipe that closes early,
+  such as `head -c 100`, ends the run with a `BrokenPipeError` and an exit code of `1` or `120`,
+  never `0` or `2`. Both were seen on Windows Python 3.13, the first on a 3000-task `--lint`.
+  Write with `--out` and `--apply` instead.
 * **A self-test that is killed mid-run leaves its `taskpulse-selftest-*` temporary folder.**
   Delete it by hand.
 * **Importing taskpulse as a module writes `__pycache__` beside it.** The folder is

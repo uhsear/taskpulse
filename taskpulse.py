@@ -659,14 +659,27 @@ def script_words(tokens):
     return words
 
 
-def shown_program(exe):
-    """The program field as it may be printed. A field that holds a command line is masked.
+PROGRAM_END = re.compile(r"\.(?:exe|bat|cmd|com)(?=[\s\"]|$)", re.I)
+
+
+def shown_program(exe, show_args=False):
+    """The program field as it may be printed. A field that holds a command line is cut.
 
     Task Scheduler takes a whole command line in Command when Arguments is empty, so
-    `sync.exe --password x` can be the program. mask_arguments() is for the arguments; a plain
-    path is returned as it is.
+    `sync.exe --password x` can be the program. The default output prints the arguments of no
+    action, so such a field prints up to its first .exe, .bat, .cmd or .com, with the rest
+    replaced by a marker. A field with no such name prints as a marker alone. `show_args` keeps
+    the whole field, with mask_arguments() applied. A field with no space is returned as it is.
     """
-    return mask_arguments(exe) if re.search(r"\s", exe) else exe
+    if not re.search(r"\s", exe):
+        return exe
+    if show_args:
+        return mask_arguments(exe)
+    found = PROGRAM_END.search(exe)
+    if not found:
+        return "[command line not shown]"
+    rest = exe[found.end():].strip().strip('"')
+    return mask_arguments(exe[:found.end()]) + (" [arguments not shown]" if rest else "")
 
 
 def classify_command(executable, arguments):
@@ -1824,7 +1837,9 @@ def describe_action(action, show_args=False):
         shown_args = mask_arguments(args, program_name(command))
     else:
         shown_args = "[arguments not shown]" if args else ""
-    shown = "Exec " + " ".join(part for part in (mask_arguments(command), shown_args) if part)
+    program = (shown_program(command, show_args) if re.search(r"\s", command)
+               else mask_arguments(command))
+    shown = "Exec " + " ".join(part for part in (program, shown_args) if part)
     return (command.lower(), args, start.lower()), shown + (
         " [Start In %s]" % start if start else "")
 
@@ -3604,22 +3619,21 @@ def self_test():
           "every exec action is linted, not only the first")
     leaky = lint_task(job(command="sync.exe --password Hunter2x", arguments="", start=""))
     check(all("Hunter2x" not in f["detail"] for f in leaky)
-          and any("sync.exe --password ***" in f["detail"] for f in leaky)
+          and any("sync.exe [arguments not shown] has no folder" in f["detail"] for f in leaky)
           and classify_command("sync.exe --password Hunter2x", "")
-          == ("sync.exe --password ***", "Executable")
+          == ("sync.exe [arguments not shown]", "Executable")
           and classify_command("python.exe", "-c x") == ("python.exe", "PythonInline")
           and classify_command(r"C:\Program Files\x\y.exe", "")
           == (r"C:\Program Files\x\y.exe", "Executable"),
-          "a secret in the Command field is masked in the lint finding and in the target, and "
-          "a path with spaces is not touched  <-- pinned defect")
+          "a command line in the Command field prints up to its program in the lint finding and "
+          "in the target, and a path with spaces is not touched  <-- pinned defect")
     for cmdline in ("sync.exe --password Hunt3rZZ9 out.csv", "python.exe --token Hunt3rZZ9 etl.py",
                     "tools\\sync.exe --password Hunt3rZZ9 report.log"):
         ending = lint_task(job(command=cmdline, arguments="", start=""))
         check(any(f["check"] == "start-in-missing" for f in ending)
               and all("Hunt3rZZ9" not in f["detail"] for f in ending)
-              and any("--password ***" in f["detail"] or "--token ***" in f["detail"]
-                      for f in ending),
-              "a command line in Command that ends in a known extension is masked in the "
+              and any("[arguments not shown]" in f["detail"] for f in ending),
+              "a command line in Command that ends in a known extension is not printed in the "
               "start-in-missing finding: %s  <-- pinned defect" % cmdline.split()[0])
     single = job(start="jobs")
     single["actions"] = single["actions"][0]
@@ -4211,6 +4225,22 @@ def self_test():
                                                  arguments=""))),
           "a command line in the Command field is masked in the health report's target and "
           "in the bare-program finding  <-- pinned defect")
+    webhook = r"C:\tools\curl.exe https://hooks.example.com/services/T0A/B0B/Zq9XvR2mLpW4sTn8"
+    hooked = changes(parsed(command=webhook, arguments=""),
+                     parsed(command=webhook + "x", arguments=""))
+    shown_hook = changes(parsed(command=webhook, arguments=""),
+                         parsed(command=webhook + "x", arguments=""), show_args=True)
+    check(shown_program(webhook) == r"C:\tools\curl.exe [arguments not shown]"
+          and shown_program(r"C:\Program Files\Vendor\tool.exe")
+          == r"C:\Program Files\Vendor\tool.exe"
+          and shown_program("sync.exe Zq9XvR2mLpW4sTn8") == "sync.exe [arguments not shown]"
+          and shown_program("curl -H X:Zq9XvR2mLpW4sTn8") == "[command line not shown]"
+          and "Zq9XvR2mLpW4sTn8" not in repr(hooked)
+          and "Zq9XvR2mLpW4sTn8" not in classify_command(webhook, "")[0]
+          and "Zq9XvR2mLpW4sTn8" in repr(shown_hook),
+          "a command line in the Command field is cut at its program in the health target, the "
+          "lint finding and the default --diff, and printed with the mask only under "
+          "--show-args  <-- pinned defect")
     diffed = changes(parsed(command="cmd.exe", arguments=r"/c net use Z: \\srv\s Hunter2OLD"),
                      parsed(command="cmd.exe", arguments=r"/c net use Z: \\srv\s Hunter2NEW"))
     check(len(diffed) == 1 and "Hunter2" not in repr(diffed),
