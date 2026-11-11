@@ -188,7 +188,7 @@ PASS  --out on an export that --diff compares is refused and the export is untou
 PASS  --diff takes exactly two paths, cannot be combined with --lint or --history, and cannot be typed as a prefix  <-- pinned defect
 PASS  a mistyped or invalid flag value is never echoed on stderr, only the flag name  <-- pinned defect
 ...
-PASS  no flag value reaches stderr in a short flag, a dash-led value, a flag that takes none, an abbreviated flag or a bad choice  <-- pinned defect
+PASS  no flag value reaches stderr in a short flag, a single-dash value, a flag that takes none, an abbreviated flag or a bad choice  <-- pinned defect
 ...
 PASS  --history 0 or less, which matches no event, and --since-record-id without --history or below 0 are usage errors, not an empty history  <-- pinned defect
 PASS  --history below 7 days is a usage error: a shorter read would still label its columns 'the last 7 days'  <-- pinned defect
@@ -200,10 +200,10 @@ PASS  importing taskpulse runs nothing and prints nothing
 PASS  the import probe writes no .pyc beside the script  <-- pinned defect
 os message table: present
 --------------------------------------------------------------------
-723 assertions, 0 failed
+726 assertions, 0 failed
 ```
 
-The same command prints `723 assertions, 0 failed` on Windows with Python 3.13, 3.12 and 3.9, and
+The same command prints `726 assertions, 0 failed` on Windows with Python 3.13, 3.12 and 3.9, and
 on Ubuntu with Python 3.12. On Linux there is no OS message table, so the line above the footer
 rule reads `os message table: absent, so its assertions check the unmapped fallback`. Six
 assertions then check the `unmapped result 0x...` text instead of the Windows wording, and the
@@ -323,7 +323,7 @@ cd taskpulse
 python taskpulse.py --self-test
 ```
 
-That is the whole setup. `--self-test` runs 723 assertions with no network, no credentials and
+That is the whole setup. `--self-test` runs 726 assertions with no network, no credentials and
 no Task Scheduler access, so it passes on a locked-down box. Then run
 `python taskpulse.py` for the health report, `python taskpulse.py --lint` for the lint, or
 `python taskpulse.py --diff old.xml new.xml` to compare two exports.
@@ -395,6 +395,29 @@ Error   \CreateExplorerShellUnelevatedTask  Registration  unmapped result 0x4001
 Error   \ViGEmBus_Updater                   Daily         unmapped result 0x00002EE7  unmapped result 0x00002EE7
 ```
 
+### What each status means
+
+`health_status()` in `taskpulse.py` gives each task one word. The first rule that fits wins, in
+this order:
+
+| Status | When |
+|---|---|
+| `Disabled` | The task is disabled. Nothing else is judged. |
+| `Warning` | The live read could not get a part of the task. A missing read is not a task that has not run. |
+| `Running` | The state is Running, or the last result is `0x41301` (running) or `0x41325` (queued). |
+| `Warning` | The last result is one of `0x41305`, `0x41306`, `0x41307`, `0x4131B` or `0x4131C` (not scheduled, terminated, no valid triggers, some triggers failed, batch logon problem). |
+| `Error` | The last result is any other nonzero code. The codes that do not count are `0`, `0x41300` (ready), `0x41301`, `0x41302` (disabled), `0x41303` (not yet run), `0x41304` (no more runs), `0x41308` (event trigger) and `0x41325`. An `Error` wins over a missed or overdue run: the failure is the stronger fact, and exit `2` follows. |
+| `Warning` | The scheduler counts one or more missed runs, or `NextRunTime` is in the past and the task is not running (overdue). |
+| `Warning` | There is no `NextRunTime`, the result is not `0x41304`, and the triggers should give one. A one-time, logon, startup, event, idle, registration or session-state trigger, or no trigger, is expected to have none. |
+| `NotYetRun` | There is no last result, or it is `0x41303`. |
+| `Success` | None of the rules above fits. |
+
+The result codes are the `SCHED_S_*` values on
+[Microsoft's constants page](https://learn.microsoft.com/en-us/windows/win32/taskschd/task-scheduler-error-and-success-constants).
+Only `Error` makes the exit code `2`. A `Warning` prints and exits `0`. Without `--show-ok`, the
+report keeps only `Warning` and `Error` rows, plus any task with a failed run in the last 7 days
+under `--history`.
+
 ## Configuration lint
 
 `--lint` reads each enabled task's principal, triggers, settings and every `Exec` action, and reports
@@ -405,8 +428,8 @@ these checks. A finding is an `Error` when the next run cannot work as configure
 |---|---|---|
 | `interactive-only` | Error for a script, Warning for a plain program | The logon type is interactive ("Run only when user is logged on", or a group principal) and an enabled trigger fires unattended: one time, daily, weekly, monthly, at startup, or on an event. A disabled trigger never fires, so it does not count. |
 | `s4u-network` | Error | The logon type is S4U ("Do not store password. The task will only have access to local computer resources.") and the action names a share: `\\server\share`, `//server/share` or `\\?\UNC\server\share`, alone or as a switch value such as `/LOG:\\server\share`. A `\\server\share` in the value of a secret switch counts too, but the finding does not name it. |
-| `service-network` | Error for LOCAL SERVICE, Warning for SYSTEM and NETWORK SERVICE | A built-in account runs an action that names a share. LOCAL SERVICE reaches the network anonymously. The other two reach it as the computer account, which the share must grant. |
-| `mapped-drive` | Warning | The action names a drive letter that is not in `--local-drives`, and the logon is not interactive. The letter counts as a drive root, such as `Z:\` or `Z:`, or in a drive-relative path with a dot or a separator after it, such as `Z:run.log` or `Z:out\daily`. A mapped drive exists only in the session that mapped it. |
+| `service-network` | Error for LOCAL SERVICE, Warning for SYSTEM and NETWORK SERVICE | A built-in account runs an action that names a share. LOCAL SERVICE reaches the network anonymously: Microsoft says the [LocalService account](https://learn.microsoft.com/en-us/windows/win32/services/localservice-account) "presents anonymous credentials on the network". The other two reach it as the computer account, which the share must grant: a service in the [NetworkService account](https://learn.microsoft.com/en-us/windows/win32/services/networkservice-account) "presents the computer's credentials to remote servers", and the [LocalSystem account](https://learn.microsoft.com/en-us/windows/win32/services/localsystem-account) says the same. |
+| `mapped-drive` | Warning | The action names a drive letter that is not in `--local-drives`, and the logon is not interactive. The letter counts as a drive root, such as `Z:\` or `Z:`, or in a drive-relative path with a dot or a separator after it, such as `Z:run.log` or `Z:out\daily`. A mapped drive exists only in the session that mapped it: Microsoft says on [Services and Redirected Drives](https://learn.microsoft.com/en-us/windows/win32/services/services-and-redirected-drives) that "each logon session receives its own set of drive letters from A to Z", and that a process "within its own logon session" cannot use "the drive letters that were established within a different logon session". |
 | `start-in-quoted` | Error | `Start In` holds a quote, at one end or both. |
 | `start-in-relative` | Error | `Start In` is not an absolute path. |
 | `start-in-missing` | Error with a relative path, Warning for a script | `Start In` is empty. It is an Error when the action names a relative file path that the lint can see, and a Warning when it runs a script that might open one. A body run by `cmd /c` or `powershell -Command` that starts with `cd`, `pushd` or `Set-Location` and an absolute folder is exempt, quoted or not. An absolute folder starts with a drive and a separator, with `\`, or with a `%VARIABLE%`, or in PowerShell with a `$variable`. A relative folder, as in `cd scripts`, is not exempt, because it resolves against `C:\Windows\System32` too. A `cd` later in the body comes too late and is not exempt. In `cmd`, four more are not exempt: `cd %JOBS%` without `/d`, because the variable can name another drive; `cd D:\jobs` without `/d`, because it keeps the current drive; `cd C:`, which only prints that drive's current folder; and `cd \\server\share`, because `cmd` cannot make a share its current folder. `pushd \\server\share` maps the share and is exempt. |
@@ -1320,7 +1343,7 @@ apart gets ignored the first night it reports one.
   letter of a one-letter `-P`, `-p` or `-k`, by `-u` or `--user` with a `:` in the value, and by the
   name of a header. These secrets still print in full: the attached `-uuser:X`, `-uX`,
   `-U user%X`, a header with another name such
-  as `-H "X-Custom: X"`, and a secret switch whose value starts with `-` or `/`, such as
+  as `-H "X-Custom: x"` with a lowercase value, and a secret switch whose value starts with `-` or `/`, such as
   `--password -X`, which is read as the next switch. The csv and json diff output and any
   `--out` file are redacted no further than the table. The self-test pins what the mask hides,
   and that these forms print, not what else it cannot see. Review a diff before it leaves the
@@ -1369,7 +1392,7 @@ apart gets ignored the first night it reports one.
 * **There is no network path**, so there is nothing to test against a stub server.
 * **Mutation survivors are test gaps, not wrong output today.** A sweep of 1839 mutants of the
   non-test code (a flipped comparison, an `and`/`or` swap, a dropped branch, a constant moved by
-  one, a swapped severity or state string) was run against the self-test at 680 assertions, a count that has since grown to 723. It
+  one, a swapped severity or state string) was run against the self-test at 680 assertions, a count that has since grown to 726. It
   killed 1716, and 123 survived. Most survivors are equivalent mutants or unused constants. Six
   gaps were real, and none gave a wrong output. After the sweep the self-test pinned the detail
   text of the Running-state `STUCK` rule and three boundaries: a refusal at exactly the 7-day
@@ -1440,8 +1463,8 @@ apart gets ignored the first night it reports one.
   are masked as secret switches, but only as the whole name, so `--pinned-file` is not. The default diff never prints arguments.
 * **The busy-log numbers come from one observation.** The figures of about 700 to 1000 events
   a day come from a single server, were seen once and were not reproduced.
-* **A bare positional secret prints in full in `--diff --show-args`.** In `x.py SECRET` nothing in the XML
-  says that the word is a secret. The mask also leaves these forms: a value after a switch
+* **A bare positional secret prints in full in `--diff --show-args`.** In `x.py secret` nothing in the XML
+  says that the word is a secret, and the mask only guesses from its shape. The mask also leaves these forms: a value after a switch
   with a neutral name (`-ArgumentList X`, `--refresh X`), a literal in a PowerShell `-Command` body such
   as `$p = 'X'`, a literal in parentheses after a secret switch such as
   `-Password (ConvertTo-SecureString 'X' -AsPlainText)`, the Oracle form `user/password@db`,
@@ -1449,7 +1472,8 @@ apart gets ignored the first night it reports one.
   and the abbreviations `-enc`, `-ec` and `-e` of `-EncodedCommand`. A one-character account
   in `-u a:X` is not masked, because the pattern needs two characters before the colon. A
   secret inside the `Command` field itself is masked when it follows a named switch, as in
-  `sync.exe --password X`, and prints when it is an unmarked positional word. Windows puts
+  `sync.exe --password X`, or when it is a generated-looking positional word, and prints when it
+  is a lowercase or short one. Windows puts
   arguments in `Arguments`.
 * **The header mask is slow on one crafted word.** A word of 60000 characters that repeats
   `key` takes about 4 seconds per side in `--diff`, because the mask runs on both the old and the
@@ -1493,18 +1517,19 @@ apart gets ignored the first night it reports one.
   was read from the provider manifest and from runs. The `Enable All Tasks History` label is
   the one that the Task Scheduler console shows, and no page was checked for it.
 * **A program field that holds a command line prints with `--show-args` under the mask alone.**
-  An unmarked positional word in a `Command` field, such as `sync.exe Hq7Zk9`, prints in the
+  An unmarked positional word in a `Command` field, such as `sync.exe hq7zk9`, prints in the
   `--diff` action row with `--show-args`. Without `--show-args`, that field prints only up to
   its first `.exe`, `.bat`, `.cmd` or `.com`. A program with no space that looks like a secret,
   such as `=HYPERLINK(1)`, prints as `***` in the `--diff` action row.
 * **The mask knows switch names, not secrets.** With `--show-args`, any value after a switch
-  with a neutral name (`--refresh X`, `--header X-Foo:X`), a token in a URL
-  path, a user in `https://X@host` and a positional word after a `.ps1` or `.bat` prints.
+  with a neutral name (`--refresh X`, `--header X-Foo:X`), a lowercase or
+  short token in a URL path, a user in `https://X@host` and a lowercase or short positional word
+  after a `.ps1` or `.bat` prints.
 * **A secret in single-quoted text in a command body prints with `--show-args`.** That covers
   `{'password': 'X'}` and a hashtable. In a double-quoted JSON member, a value with an escaped
   quote, such as `"ab\"cd X"`, is masked only up to the escaped quote, and the rest prints.
 * **An unparenthesized `ConvertTo-SecureString 'X' -AsPlainText` prints with `--show-args`.**
-  So do its `-String 'X'` form and the value of `-ArgumentList '--pass','X'`.
+  So do its `-String 'X'` form and the values of a quoted list such as `-ArgumentList 'a','X'`.
 * **Do not read the exit code through a pipe that can close early.** A pipe that closes early,
   such as `head -c 100`, ends the run with a `BrokenPipeError` and an exit code of `1` or `120`,
   never `0` or `2`. Both were seen on Windows Python 3.13, the first on a 3000-task `--lint`.
@@ -1517,9 +1542,10 @@ apart gets ignored the first night it reports one.
   and service-account logon behaviour follows Microsoft's
   [`TASK_LOGON_TYPE` page](https://learn.microsoft.com/en-us/windows/win32/api/taskschd/ne-taskschd-task_logon_type):
   S4U has "no access to either the network or to encrypted files", and `INTERACTIVE_TOKEN` means
-  the "User must already be logged on". The README cites no page for LOCAL SERVICE having
-  anonymous network access while NETWORK SERVICE uses the computer account, or for a mapped drive
-  being absent in a non-interactive session.
+  the "User must already be logged on". The pages for the LOCAL SERVICE, NETWORK SERVICE and
+  SYSTEM network credentials and for a drive letter that belongs to one logon session are cited in
+  the lint table above. No page says that a task with a non-interactive logon always runs in a
+  new logon session, so the `mapped-drive` check rests on that reading of the logon types.
 * **A reader cannot rerun the example output blocks.** The example outputs come from synthetic
   files that are not shipped. The self-test does not build those fixtures and does not pin the rows
   of the `--lint` and `--diff` example tables. Only the `--history` example has a stub check.
@@ -1528,8 +1554,32 @@ apart gets ignored the first night it reports one.
   Use `--format json` for the full text.
 * **The self-test and the README measurements assume English Windows message text.** A
   non-English Windows install is expected to fail the OS-message assertions. This is untested.
-* **`--diff --show-args` leaves `-ArgumentList --pass,X` unmasked.** A 52-shape sweep found this
-  one leak. The default diff and lint output printed no secret in that sweep.
+* **A secret that starts with two dashes is echoed in a usage error.**
+  `python taskpulse.py --password --Hunter2xyz` prints
+  `unrecognized arguments: --password --Hunter2xyz (2 in all, values not echoed)`. A long flag
+  typed with text attached to its name, such as `--passwordHunter2xyz`, is echoed as the flag
+  name. A value that looks like a long flag name is echoed, and only a value that starts with a
+  single dash is hidden. The self-test label says "a single-dash value" for this reason.
+* **`--diff --show-args` masks a generated-looking word, not every secret.** A bare word of seven
+  or more letters and digits that holds a digit or a capital letter, such as `Hunter2` or
+  `ZZSECKOLD`, is masked, as is a URL path segment of that shape or of 20 or more characters.
+  A lowercase or shorter secret, such as `hunter`, still prints, and so do the shapes in the
+  limits above. The comma form `--pass,X` is masked.
+* **Other secret switches print under `--diff --show-args`.** A name list cannot know every
+  switch: `--psw`, `--license` and `--code` print a lowercase or short value in full, as do
+  `-s X` and `cmd /c echo x`. The default diff prints no argument.
+* **Some folder and hand-made inputs end a lint oddly.** A folder lint stops with exit `1` and
+  prints no report when a file that is not task XML, such as `desktop.ini` or `notes.txt`, sits
+  in the folder. A task with no `Actions` element, or an empty `<Task/>`, lints clean with exit
+  `0` and `No findings.`. Task Scheduler exports always carry an action.
+* **`--lint=VALUE` and `--diff` paths are echoed in a read error.** `taskpulse: VALUE: no <Task>
+  element found` and `taskpulse: [Errno 2] No such file or directory: 'VALUE'` name the path
+  that could not be read, so do not put a secret in a path.
+* **A second `--diff` positional gives an empty list.** The usage error reads
+  `unrecognized arguments:  (1 in all, values not echoed)`. It is cosmetic, and the exit code is
+  `64`.
+* **`--timeout` below 1 is a usage error.** It exits `64`, because a zero or negative wait could
+  only end as a timeout.
 * **A control character in a live task name or author prints unchanged.** An exported XML file
   cannot carry one, because the XML parser rejects it, but the live read prints it to the terminal.
 * **A mistyped flag does not echo its value.** The usage error names a long flag, such as

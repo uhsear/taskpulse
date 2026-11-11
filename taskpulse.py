@@ -232,6 +232,14 @@ NAMED_EXTS = PATH_EXTS | {".exe"}
 ROOTED = re.compile(r"^(?:[A-Za-z]:[\\/]|[\\/]|%)")
 # The password in the user:password@host of a URL.
 URL_AUTH = re.compile(r"(://[^/\s:@]*:)[^@/\s]*@")
+# The path of a URL, up to its query. A token sits in it as often as in the query (a webhook is
+# /hooks/TOKEN), so mask_url_path() hides each segment that looks like one.
+URL_PATH = re.compile(r"(://[^/\s?#]+)(/[^\s?#]*)")
+# A bare word that no switch names, in --diff --show-args: seven or more letters and digits that
+# hold a digit or a capital and are not all lowercase, which is how a generated secret looks. A
+# plain word such as robocopy, daily or --plain prints. A lowercase password still does; see
+# the README Limits.
+BARE_SECRET = re.compile(r"^(?=[A-Za-z0-9]*(?:\d|[A-Z]))[A-Za-z0-9]{7,}$")
 # A share as \\server\share, //server/share or the long form \\?\UNC\server\share. It is
 # matched against switch values (see arg_values), not the raw command line, so the share in
 # /LOG:\\server\share is found. The lookbehind stops the // of a URL from reading as a share.
@@ -1744,6 +1752,13 @@ def read_task_files(paths, walk=os.walk, islink=os.path.islink):
 # task definition diff (--diff) - pure: two lists of parsed tasks in, rows out
 # --------------------------------------------------------------------------
 
+def mask_url_path(hit):
+    """Replace each path segment of a URL that looks like a token with ***, keep the rest."""
+    segments = [("***" if BARE_SECRET.match(segment) or len(segment) >= 20 else segment)
+                for segment in hit.group(2).split("/")]
+    return hit.group(1) + "/".join(segments)
+
+
 def mask_word(value, state):
     """(shown text, state for the next word) of one word of a command line, for mask_arguments.
 
@@ -1751,11 +1766,11 @@ def mask_word(value, state):
     "cred" when it was -u or --user, whose value is a secret only when it holds a ':'.
     """
     if not re.search(r"\s", value):
-        value = URL_AUTH.sub(r"\1***@", value)
+        value = URL_PATH.sub(mask_url_path, URL_AUTH.sub(r"\1***@", value))
     head, secret, after = "", state == "secret", ""
     if value[:1] in ("-", "/") and value[:2] != "//" and (
             not re.search(r"\s", value) or re.match(r"[-/]+[^=:\s]*[=:]", value)):
-        dashes, name, sep, value = re.match(r"([-/]*)([^=:\s]*)([=:]?)(.*)", value,
+        dashes, name, sep, value = re.match(r"([-/]*)([^=:,\s]*)([=:,]?)(.*)", value,
                                             re.DOTALL).groups()
         head = dashes + name + sep
         attached = (dashes == "-" and name[:1] in MASKED_LETTERS and len(name) > 1
@@ -1787,7 +1802,8 @@ def mask_word(value, state):
                 else '"***"' if secret else '"%s"' % mask_arguments(inner))
         return head + text, ""
     header = None if head else SECRET_HEADER.match(value)
-    opaque = re.search(r"[=+]", value) and extension_of(value) not in PATH_EXTS
+    opaque = ((re.search(r"[=+]", value) or (not head and BARE_SECRET.match(value)))
+              and extension_of(value) not in PATH_EXTS)
     if header:
         return header.group(1) + "***", after
     return head + ("***" if value and (secret or opaque) else value), after
@@ -4227,7 +4243,7 @@ def self_test():
           "a word with a quoted space, such as msiexec's TARGETDIR=\"C:\\Program Files\\App\", "
           "does not recurse for ever, and a secret in one is still masked  <-- pinned defect")
     check(all("Hunter2" in mask_arguments(line) for line in (
-        "-usvc:Hunter2", "-U svc%Hunter2", "--password -Hunter2", '-H "X-Custom: Hunter2"', "-uHunter2")),
+        "-usvc:Hunter2", "-U svc%Hunter2", "--password -Hunter2", "-uHunter2")),
           "the documented gaps: these forms still print in full, so the README lists them")
     check(mask_arguments(r"/c net use Z: \\srv\share Hunter2 && robocopy a b", "cmd")
           == "/c net *** *** *** *** && robocopy a b"
@@ -4258,10 +4274,10 @@ def self_test():
           and shown_program("curl -H X:Zq9XvR2mLpW4sTn8") == "[command line not shown]"
           and "Zq9XvR2mLpW4sTn8" not in repr(hooked)
           and "Zq9XvR2mLpW4sTn8" not in classify_command(webhook, "")[0]
-          and "Zq9XvR2mLpW4sTn8" in repr(shown_hook),
+          and "Zq9XvR2mLpW4sTn8" not in repr(shown_hook) and "***" in repr(shown_hook),
           "a command line in the Command field is cut at its program in the health target, the "
           "lint finding and the default --diff, and printed with the mask only under "
-          "--show-args  <-- pinned defect")
+          "--show-args, where a token in a URL path is masked  <-- pinned defect")
     diffed = changes(parsed(command="cmd.exe", arguments=r"/c net use Z: \\srv\s Hunter2OLD"),
                      parsed(command="cmd.exe", arguments=r"/c net use Z: \\srv\s Hunter2NEW"))
     check(len(diffed) == 1 and "Hunter2" not in repr(diffed),
@@ -4301,6 +4317,26 @@ def self_test():
           and mask_arguments("-S srv -U sa") == "-S srv -U sa",
           "the value of -P, -p and --auth is masked, and --author and other letters are not  "
           "<-- pinned defect")
+    comma = ((r"/c \jobs\run.exe --pass,ZZSECN15OLD", "cmd"),
+             (r"-ArgumentList --pass,ZZSECN14OLD", "powershell"),
+             ("https://host.example/hooks/ZZSECPATHO", "curl"),
+             ("https://host.example/api/ZZSECSEGO/items", "curl"),
+             ("-u joe https://host.example/api/Zq9XvR2mLpW4sTn8/x?id=5", "curl"),
+             ("https://host.example/v1/abcdefghijklmnopqrstuvwxyz", "curl"),
+             (r"ZZSECKOLD --plain", "tool"))
+    check(all("ZZSEC" not in mask_arguments(line, program) and "Zq9X" not in mask_arguments(
+        line, program) and "abcdefghij" not in mask_arguments(line, program)
+              and "***" in mask_arguments(line, program) for line, program in comma)
+          and mask_arguments(r"/c \jobs\run.exe --pass,X --keep", "cmd")
+          == r"/c \jobs\run.exe --pass,*** --keep"
+          and "ZZSECKOLD" not in shown_program(r"C:\Tools\tool.exe ZZSECKOLD --plain", True),
+          "--show-args masks a --pass,VALUE written with a comma, a token in a URL path and a "
+          "bare generated word after a program  <-- pinned defect")
+    check(mask_arguments("https://host.example/api/items/daily robocopy a b --plain -Port 80 "
+                         "Report.csv Daily") == "https://host.example/api/items/daily "
+          "robocopy a b --plain -Port 80 Report.csv Daily"
+          and mask_arguments("-Path a,b -Name x,y") == "-Path a,b -Name x,y",
+          "a plain URL path, plain words, a number and a comma list are left as they were")
 
     def secretive(args, command="C:\\jobs\\tool.exe", show_args=True):
         return changes(parsed(command=command, arguments=args[0]),
@@ -4990,12 +5026,18 @@ def self_test():
             leaks = [cli(*argv) for argv in shapes]
             check([code for code, _, _ in leaks] == [64] * len(shapes)
                   and not any("Hunter2" in out + err for _, out, err in leaks),
-                  "no flag value reaches stderr in a short flag, a dash-led value, a flag that "
+                  "no flag value reaches stderr in a short flag, a single-dash value, a flag that "
                   "takes none, an abbreviated flag or a bad choice  <-- pinned defect")
             usage = [cli(*argv)[0] for argv in (("--bogus",), ("--timeout", "abc"),
                                                 ("--format", "xml"), ("--history", "x"))]
             check(usage == [64] * 4,
                   "a usage error exits 64, never 2, which means an Error finding  <-- pinned defect")
+            refused = [cli(*argv) for argv in (("--timeout", "0"), ("--timeout", "-5"))]
+            check([code for code, _, _ in refused] == [64, 64]
+                  and all("--timeout must be 1 or more" in err and out == ""
+                          for _, out, err in refused),
+                  "--timeout 0 or below is a usage error, not a query that always times out  "
+                  "<-- pinned defect")
             refused = [cli(*argv) for argv in (("--history", "0"), ("--history", "-3"),
                                                ("--since-record-id", "5"),
                                                ("--history", "--since-record-id", "-1"))]
@@ -5318,6 +5360,8 @@ def main(argv=None):
     if (args.since_record_id or 0) < 0:
         parser.error("--since-record-id must be 0 or more")
     since = args.since_record_id  # None is a cold start; 0, as an empty log prints, is not
+    if args.timeout < 1:
+        parser.error("--timeout must be 1 or more")
     if args.stuck_hours is not None and args.history is None:
         parser.error("--stuck-hours needs --history")
     if args.stuck_hours is not None and args.stuck_hours < 1:
