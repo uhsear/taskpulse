@@ -186,6 +186,7 @@ PASS  --lint of an export that holds only Microsoft's own tasks has no result: e
 PASS  --out on an export that --diff compares is refused and the export is untouched  <-- pinned defect
 ...
 PASS  --diff takes exactly two paths, cannot be combined with --lint or --history, and cannot be typed as a prefix  <-- pinned defect
+PASS  a mistyped or invalid flag value is never echoed on stderr, only the flag name  <-- pinned defect
 ...
 PASS  --history 0 or less, which matches no event, and --since-record-id without --history or below 0 are usage errors, not an empty history  <-- pinned defect
 PASS  --history below 7 days is a usage error: a shorter read would still label its columns 'the last 7 days'  <-- pinned defect
@@ -197,10 +198,10 @@ PASS  importing taskpulse runs nothing and prints nothing
 PASS  the import probe writes no .pyc beside the script  <-- pinned defect
 os message table: present
 --------------------------------------------------------------------
-721 assertions, 0 failed
+722 assertions, 0 failed
 ```
 
-The same command prints `721 assertions, 0 failed` on Windows with Python 3.13, 3.12 and 3.9, and
+The same command prints `722 assertions, 0 failed` on Windows with Python 3.13, 3.12 and 3.9, and
 on Ubuntu with Python 3.12. On Linux there is no OS message table, so the line above the footer
 rule reads `os message table: absent, so its assertions check the unmapped fallback`. Six
 assertions then check the `unmapped result 0x...` text instead of the Windows wording, and the
@@ -254,7 +255,8 @@ $ echo $?
 Task Scheduler itself shows every field, and shows it accurately. The Task Scheduler console,
 `Get-ScheduledTask` and `schtasks /query /v` all expose the logon type, the account, the
 `Start In` folder and the action. `schtasks /query /v /fo list` even prints
-`Logon Mode: Interactive only`. Nothing is hidden. What they do not do is judge a field
+`Logon Mode:` followed by `Interactive only`. Nothing is hidden. The real output pads the
+label with spaces, and the README cites no Microsoft page for that line. What they do not do is judge a field
 against the others. An interactive logon is correct for a logon-triggered updater and wrong
 for a nightly job. An empty `Start In` is harmless for `backup.exe /to C:\backups` and fatal
 for `python rebuild.py`. taskpulse makes those judgements, and it makes them from the same
@@ -319,7 +321,7 @@ cd taskpulse
 python taskpulse.py --self-test
 ```
 
-That is the whole setup. `--self-test` runs 721 assertions with no network, no credentials and
+That is the whole setup. `--self-test` runs 722 assertions with no network, no credentials and
 no Task Scheduler access, so it passes on a locked-down box. Then run
 `python taskpulse.py` for the health report, `python taskpulse.py --lint` for the lint, or
 `python taskpulse.py --diff old.xml new.xml` to compare two exports.
@@ -1136,14 +1138,17 @@ apart gets ignored the first night it reports one.
   them is made up. The `--history` example in [Run fate](#run-fate) comes from a stub with those
   tasks and events. The self-test builds the same stub and checks the rows, but it does not
   print the table. The `--lint` example outputs come from synthetic inputs that the repo does not
-  ship either. The self-test checks the same rows.
+  ship either. The self-test checks single findings, such as `s4u-network`, one at a time. It
+  does not pin the rows of the `--lint` or `--diff` example tables.
 * **The measured results are point-in-time.** The live-versus-XML comparison of the lint, the
   findings without `--all`, the share of tasks with no time limit and the diff of the two
   exports were measured once on one machine. Its task set changes, so a rerun can give other
   numbers. This README gives those counts as words, not numbers.
 * **Linux coverage used a virtualenv.** Branch coverage is 100 percent on Windows and on
   Linux. Coverage is not installed for the Linux host's system `python3`, so the Linux
-  measurement ran in a virtualenv of that same Python 3.12.3.
+  measurement ran in a virtualenv of that same Python 3.12.3. Windows used coverage's C tracer
+  and Linux its pure-Python tracer. Coverage was not measured on Python 3.9, although the
+  self-test ran green there.
 * **The quoted self-test run is an excerpt.** Each `...` stands for `PASS` lines left out. Every
   line shown appears in a real run, in that order, and the footer count is the full count.
 * **Application exit codes are opaque.** The OS message table only knows OS codes. A task whose
@@ -1231,9 +1236,10 @@ apart gets ignored the first night it reports one.
   no task needing attention prints `[]`, the same as a clean run, and exits `1`. In the table
   format the same run prints `No tasks need attention.` on stdout and the failure on stderr.
   Its `--out` file is the same as the file of a clean run.
-* **Python 3.9 reads only some timestamp shapes.** On 3.9 a timestamp with 1, 2, 4 or 5
-  fractional digits, a `+HHMM` offset or a `+HH` offset is read as having no time. 3.12 and
-  3.13 accept them, so a `trigger-expired` finding can differ by Python version on a hand-edited
+* **Python 3.9 reads only some timestamp shapes.** On 3.9 a timestamp with a `+HHMM` offset or
+  a `+HH` offset is read as having no time, because `datetime.fromisoformat` rejects those
+  before 3.11. A fraction of any length parses on 3.9, because the reader pads or cuts it to 6
+  digits first. 3.11 and later accept both offsets, so a `trigger-expired` finding can differ by Python version on a hand-edited
   export. PowerShell's round-trip format always writes 7 digits, and Task Scheduler's own
   formats parse everywhere.
 * **The self-test needs hard links in its temporary folder.** On a FAT or exFAT temporary
@@ -1338,7 +1344,8 @@ apart gets ignored the first night it reports one.
   when it is a file or folder the same run lints or compares, so any other file taskpulse can
   write, such as a different export or the script itself, is replaced.
 * **`--lint` skips disabled tasks.** A folder of only disabled tasks prints `No findings.` and
-  exits `0`.
+  exits `0`. `--diff` prints `No differences.` for the same case. A check that expects tasks to
+  be enabled does not notice that they were switched off.
 * **Keep one file per task in an export folder.** `--diff` keys a task by its full name, so two
   files that define one task on the same side stop it with exit `1` and a message that names the
   folder and the task. `--lint` does not check for this and judges both.
@@ -1361,7 +1368,7 @@ apart gets ignored the first night it reports one.
 * **There is no network path**, so there is nothing to test against a stub server.
 * **Mutation survivors are test gaps, not wrong output today.** A sweep of 1839 mutants of the
   non-test code (a flipped comparison, an `and`/`or` swap, a dropped branch, a constant moved by
-  one, a swapped severity or state string) was run against the self-test at 680 assertions, a count that has since grown to 721. It
+  one, a swapped severity or state string) was run against the self-test at 680 assertions, a count that has since grown to 722. It
   killed 1716, and 123 survived. Most survivors are equivalent mutants or unused constants. Six
   gaps were real, and none gave a wrong output. After the sweep the self-test pinned the detail
   text of the Running-state `STUCK` rule and three boundaries: a refusal at exactly the 7-day
@@ -1377,8 +1384,11 @@ apart gets ignored the first night it reports one.
   false `start-in-missing` Error and exit `2`. Fill `Start In` to clear it.
 * **More credential forms print with `--show-args`.** `-Authorization Basic X` masks the word
   `Basic` and prints `X`. Curl's combined `-su user:X`, rar's attached `-hpX`, a positional
-  password such as `smbclient //srv/share X` and `reg add ... /d X` print in full. Without
-  `--show-args` the diff prints none of them.
+  password such as `smbclient //srv/share X` and `reg add ... /d X` print in full. A token as
+  the whole user part of a URL, such as `git clone https://TOKEN@github.com/o/r.git`, prints in
+  full, because the URL mask needs a `user:` before the password. A secret inside inline code,
+  such as `python -c "login('X')"`, and an attached value, such as `-s X`, `/s X`, `-i X` or
+  `-PasswordX`, print in full. Without `--show-args` the diff prints none of them.
 * **A group principal reads as a user.** Windows writes an interactive principal for a group,
   such as `S-1-5-32-545`, as a `GroupId`. The interactive-only finding then says the task runs
   only while that SID is logged on, as if it were a user.
@@ -1441,8 +1451,14 @@ apart gets ignored the first night it reports one.
   `sync.exe --password X`, and prints when it is an unmarked positional word. Windows puts
   arguments in `Arguments`.
 * **The header mask is slow on one crafted word.** A word of 60000 characters that repeats
-  `key` takes about 4 seconds in `--diff`, and an ordinary long word does not. Only a crafted
-  export is slow.
+  `key` takes about 4 seconds per side in `--diff`, because the mask runs on both the old and the
+  new side. An ordinary long word is fast. Only a crafted export is slow.
+* **A missing input file prints the operating system's text.** `--lint` or `--diff` of a path
+  that does not exist ends with exit `1` and `[Errno 2] No such file or directory`, without
+  naming the flag. Check the path you typed.
+* **An empty `<Task/>` lints clean.** An export with a `Task` root and no `Actions` and no
+  `Triggers` prints `No findings.` and exits `0`. A real Task Scheduler export always has
+  `Actions`, so a truncated hand-edited file can read as clean.
 * **A folder with a file that is not task XML stops the run.** `--lint` or `--diff` of a
   folder that holds `notes.txt` ends with exit `1` and `no <Task> element found`. The failure
   is loud, not a false pass.
@@ -1504,7 +1520,8 @@ apart gets ignored the first night it reports one.
   anonymous network access while NETWORK SERVICE uses the computer account, or for a mapped drive
   being absent in a non-interactive session.
 * **A reader cannot rerun the example output blocks.** The example outputs come from synthetic
-  files that are not shipped. The self-test pins the same rows rather than printing these tables.
+  files that are not shipped. The self-test does not build those fixtures and does not pin the rows
+  of the `--lint` and `--diff` example tables. Only the `--history` example has a stub check.
 * **Table cells are cut, so a long reason can end mid-word.** The table cuts health cells at 60
   characters and lint and diff cells at 240. The `WHY` text of a `STUCK` row can end mid-word.
   Use `--format json` for the full text.
@@ -1514,8 +1531,9 @@ apart gets ignored the first night it reports one.
   one leak. The default diff and lint output printed no secret in that sweep.
 * **A control character in a live task name or author prints unchanged.** An exported XML file
   cannot carry one, because the XML parser rejects it, but the live read prints it to the terminal.
-* **A mistyped flag echoes its value.** argparse repeats an unrecognised argument on stderr, so
-  `--password X` prints `X` in the usage error.
+* **A mistyped flag does not echo its value.** The usage error names the flag, such as
+  `--password`, and the count of arguments. It never repeats a value, also not an invalid
+  `--timeout` or `--format` value. The self-test pins this with a fake password.
 * **A CSV report has no byte-order mark.** `--apply` writes UTF-8 without one, so Excel can show
   non-ASCII task names wrongly until the file is imported as UTF-8. The formula guard checks only
   the first character of a cell, so a cell that starts with a space before a formula is written

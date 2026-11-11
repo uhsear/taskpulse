@@ -4973,6 +4973,14 @@ def self_test():
                   "--diff takes exactly two paths, cannot be combined with --lint or "
                   "--history, and cannot be typed as a prefix  <-- pinned defect")
 
+            leaks = [cli(*argv) for argv in (("--password", "Hunter2"), ("--password=Hunter2",),
+                                             ("--timeout", "Hunter2"), ("--format", "Hunter2"))]
+            check([code for code, _, _ in leaks] == [64] * 4
+                  and not any("Hunter2" in out + err for _, out, err in leaks)
+                  and "--password" in leaks[0][2] and "--password" in leaks[1][2]
+                  and "invalid" in leaks[2][2],
+                  "a mistyped or invalid flag value is never echoed on stderr, only the flag "
+                  "name  <-- pinned defect")
             usage = [cli(*argv)[0] for argv in (("--bogus",), ("--timeout", "abc"),
                                                 ("--format", "xml"), ("--history", "x"))]
             check(usage == [64] * 4,
@@ -5139,6 +5147,16 @@ class Parser(argparse.ArgumentParser):
     """argparse exits 2 on a usage error, and 2 here means an Error finding. Use 64 instead."""
 
     def error(self, message):
+        # A mistyped secret flag (--password X) or value would otherwise be echoed to stderr,
+        # which a monitoring check logs. Keep the flag names, drop every value.
+        message = re.sub(
+            r"^unrecognized arguments: (.*)$",
+            lambda hit: "unrecognized arguments: %s (%d in all, values not echoed)" % (
+                " ".join(word.split("=")[0] for word in hit.group(1).split()
+                         if word.startswith("-")), len(hit.group(1).split())),
+            message)
+        message = re.sub(r"(invalid [\w ]*?value: |invalid choice: )'.*?'", r"\1<hidden>",
+                         message)
         self.print_usage(sys.stderr)
         self.exit(USAGE_ERROR, "%s: error: %s\n" % (self.prog, message))
 
