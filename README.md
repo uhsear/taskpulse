@@ -124,6 +124,7 @@ PASS  a task that gains DeleteExpiredTaskAfter PT0S is a change: Microsoft says 
 PASS  a monthly trigger that moves one of its repeated Day or Week values is a change; the last value kept used to hide it  <-- pinned defect
 PASS  a timestamp past the last UTC instant is None, not an OverflowError  <-- pinned defect
 ...
+PASS  one instant written with a summer and a winter offset is no change, and the same wall clock at another offset is a change  <-- pinned defect
 PASS  by default the arguments are compared but not printed, and a changed one says so  <-- pinned defect
 ...
 PASS  a logon change on a task that runs ArcGIS Pro's Python also names the licence conditions  <-- pinned defect
@@ -196,10 +197,10 @@ PASS  importing taskpulse runs nothing and prints nothing
 PASS  the import probe writes no .pyc beside the script  <-- pinned defect
 os message table: present
 --------------------------------------------------------------------
-711 assertions, 0 failed
+713 assertions, 0 failed
 ```
 
-The same command prints `711 assertions, 0 failed` on Windows with Python 3.13, 3.12 and 3.9, and
+The same command prints `713 assertions, 0 failed` on Windows with Python 3.13, 3.12 and 3.9, and
 on Ubuntu with Python 3.12. On Linux there is no OS message table, so the line above the footer
 rule reads `os message table: absent, so its assertions check the unmapped fallback`. Six
 assertions then check the `unmapped result 0x...` text instead of the Windows wording, and the
@@ -281,8 +282,9 @@ changed, and it needs nothing new. On the development machine, `Export-Scheduled
 ignored, and the rest differed in one quote character of a description. So a text diff is
 a good tool for two exports from one writer. It is not enough when the export changes shape
 without the task changing: a setting written out at its default, triggers in another order, or
-a new registration date. Those are text changes and not task changes. `--diff` does not report
-them, and it names the field when something did change.
+a new registration date, or a trigger time that Windows wrote with the offset of the export day.
+Those are text changes and not task changes. `--diff` does not report them, and it names the
+field when something did change.
 
 ## Requirements
 
@@ -317,7 +319,7 @@ cd taskpulse
 python taskpulse.py --self-test
 ```
 
-That is the whole setup. `--self-test` runs 711 assertions with no network, no credentials and
+That is the whole setup. `--self-test` runs 713 assertions with no network, no credentials and
 no Task Scheduler access, so it passes on a locked-down box. Then run
 `python taskpulse.py` for the health report, `python taskpulse.py --lint` for the lint, or
 `python taskpulse.py --diff old.xml new.xml` to compare two exports.
@@ -520,7 +522,7 @@ is explained after the table:
 |---|---|---|
 | `MultipleInstancesPolicy` | `IgnoreNew`: "Does not start new instance if an existing instance of the task is running." | [multipleInstancesPolicyType](https://learn.microsoft.com/en-us/windows/win32/taskschd/taskschedulerschema-multipleinstancespolicytype-simpletype) |
 | `ExecutionTimeLimit` | 72 hours: "By default, a task will be stopped 72 hours after it starts to run." `PT0S` runs indefinitely. | [ITaskSettings::ExecutionTimeLimit](https://learn.microsoft.com/en-us/windows/win32/api/taskschd/nf-taskschd-itasksettings-get_executiontimelimit) |
-| `RunOnlyIfIdle`, `RunOnlyIfNetworkAvailable` | `false` | [settingsType](https://learn.microsoft.com/en-us/windows/win32/taskschd/taskschedulerschema-settingstype-complextype) |
+| `RunOnlyIfIdle`, `RunOnlyIfNetworkAvailable` | `false` | [settingsType](https://learn.microsoft.com/en-us/windows/win32/taskschd/taskschedulerschema-settingstype-complextype), [RunOnlyIfIdle](https://learn.microsoft.com/en-us/windows/win32/taskschd/taskschedulerschema-runonlyifidle-settingstype-element): "Specifies that the task is run only when the computer is in an idle state.", [RunOnlyIfNetworkAvailable](https://learn.microsoft.com/en-us/windows/win32/taskschd/taskschedulerschema-runonlyifnetworkavailable-settingstype-element): "Specifies that the Task Scheduler will run the task only when a network is available." |
 | `Enabled`, `AllowStartOnDemand`, `AllowHardTerminate`, `DisallowStartIfOnBatteries`, `StopIfGoingOnBatteries` | `true` | settingsType |
 | `StartWhenAvailable`, `WakeToRun`, `Hidden`, `UseUnifiedSchedulingEngine`, `DisallowStartOnRemoteAppSession` | `false` | settingsType |
 | `Priority` | `7` | settingsType |
@@ -991,8 +993,8 @@ apart gets ignored the first night it reports one.
   such as 240.0 hours, even beside a healthy 12-minute run.
 * **A disabled task whose last run never logged an end event has the fate STUCK**, because only
   `Ready` and `Queued` rule `STUCK` out. Its status stays `Disabled`, so the default table
-  hides the row in every format. It shows with `--show-ok`, and its `fate` field says `STUCK`
-  in the `json` and `csv` output.
+  hides the row in every format, unless the task also failed in the last 7 days. It shows with
+  `--show-ok`, and its `fate` field says `STUCK` in the `json` and `csv` output.
 * **STUCK and BLOCKED never change the exit code.** A check that reads only the exit code stays
   green over a hung job. Read the `fate` field of the `json` or `csv` output if a hung or
   blocked job must fail a check.
@@ -1138,7 +1140,9 @@ apart gets ignored the first night it reports one.
   line shown appears in a real run, in that order, and the footer count is the full count.
 * **Application exit codes are opaque.** The OS message table only knows OS codes. A task whose
   program exits `1` or `0x00002EE7` prints `unmapped result 0x...`, because inventing a meaning
-  for an application's own code would be worse than admitting it is unknown.
+  for an application's own code would be worse than admitting it is unknown. A code outside the
+  documented `SCHED_*` set gets its verdict from a rule (any nonzero code is `Error`) and not
+  from a meaning that Microsoft documents.
 * **Overdue is measured against the scheduler's own `NextRunTime`.** If the Task Scheduler
   service is stopped, that field goes stale and every recurring task looks overdue at once.
 * **The live reads are Windows only.** On any other platform the health report and a live
@@ -1267,7 +1271,10 @@ apart gets ignored the first night it reports one.
   breaks the table layout and can forge an extra row, such as an `OK` line. Treat the table as
   untrusted text and use `--format json` or `csv` for automation.
 * **Hostile XML ends in a plain error.** XML nested about 1500 levels deep ends with
-  `maximum recursion depth exceeded` and exit `1`, with no file name in the message. A DOCTYPE
+  `maximum recursion depth exceeded` and exit `1`, with no file name in the message. That error
+  fires only for nesting under `Settings` or a trigger, and its wording varies by Python
+  version: 3.9 adds `while calling a Python object`. The same nesting directly under the `Task`
+  root lints with no error and exit `0`. A DOCTYPE
   with entities is refused as not well-formed, so entity expansion is not possible.
 * **An export file has no size cap.** Each file is read whole into memory, so a very large file
   in a linted folder can exhaust memory. Symbolic-link subfolders are refused, but a symbolic
@@ -1336,7 +1343,7 @@ apart gets ignored the first night it reports one.
 * **There is no network path**, so there is nothing to test against a stub server.
 * **Mutation survivors are test gaps, not wrong output today.** A sweep of 1839 mutants of the
   non-test code (a flipped comparison, an `and`/`or` swap, a dropped branch, a constant moved by
-  one, a swapped severity or state string) was run against the self-test at 680 assertions. It
+  one, a swapped severity or state string) was run against the self-test at 680 assertions, a count that has since grown to 713. It
   killed 1716, and 123 survived. Most survivors are equivalent mutants or unused constants. Six
   gaps were real, and none gave a wrong output. After the sweep the self-test pinned the detail
   text of the Running-state `STUCK` rule and three boundaries: a refusal at exactly the 7-day
@@ -1374,7 +1381,9 @@ apart gets ignored the first night it reports one.
 * **The network run-condition is not measured.** An unmet idle condition left `Last Run Result`
   at the previous run, on a task that had never run (it stayed `267011`). A fake network
   profile name did not stop the task from running, so the network claim rests on Microsoft's
-  wording alone.
+  wording alone, on the [RunOnlyIfNetworkAvailable](https://learn.microsoft.com/en-us/windows/win32/taskschd/taskschedulerschema-runonlyifnetworkavailable-settingstype-element)
+  and [RunOnlyIfIdle](https://learn.microsoft.com/en-us/windows/win32/taskschd/taskschedulerschema-runonlyifidle-settingstype-element)
+  element pages. Neither page says more than one sentence.
 * **A saved report is sensitive.** Task names on a real machine hold accounts, SIDs and
   e-mail-style names, and the report prints run-as accounts and authors. Treat a saved file
   that way.
@@ -1419,6 +1428,43 @@ apart gets ignored the first night it reports one.
 * **The self-test writes task XML to a temporary folder.** It creates the folder with
   `tempfile.mkdtemp` and removes it in a `finally` block. It writes nowhere else. The files its
   own `--apply` tests produce go into that folder too.
+* **`--diff` compares a trigger time that has an offset as a UTC instant.** Windows writes the
+  offset of the day of the export, so one unchanged task read as `-04:00` in summer and `-05:00`
+  in winter. Compared as text, 3 of 13 unchanged tasks on the development machine differed
+  across a clock change. A time with no offset is compared as written, and the same wall clock
+  at another offset is a change.
+* **A task whose actions are all COM handlers has no command line, so `--lint` reports nothing
+  for it.**
+* **An empty `Actions` element gets no finding, and neither does an `ExecutionTimeLimit` that
+  is not a duration**, such as `NOTADUR`. The task lints clean with exit `0`. Task Scheduler
+  does not write either form.
+* **The `Running` state `STUCK` rule takes `LastRunTime` as the start of the current run.** The
+  [IRegisteredTask::get_LastRunTime](https://learn.microsoft.com/en-us/windows/win32/api/taskschd/nf-taskschd-iregisteredtask-get_lastruntime)
+  page says only "Gets the time the registered task was last run." No `Running` task was
+  available to measure it.
+* **The event meanings have no Microsoft documentation page.** What each event number means
+  was read from the provider manifest and from runs. The `Enable All Tasks History` label is
+  the one that the Task Scheduler console shows, and no page was checked for it.
+* **The program field is masked by pattern in every mode.** An unmarked positional word in a
+  `Command` field that holds a whole command line, such as `sync.exe Hq7Zk9`, prints in the
+  health report, the bare-program finding and `--diff`, with or without `--show-args`. A
+  program that looks like a secret, such as `=HYPERLINK(1)`, prints as `***` in the `--diff`
+  action row.
+* **The mask knows switch names, not secrets.** With `--show-args`, any value after a switch
+  with a neutral name (`--refresh X`, `--sessionid X`, `--header X-Foo:X`), a token in a URL
+  path, a user in `https://X@host` and a positional word after a `.ps1` or `.bat` prints.
+* **A secret in single-quoted text in a command body prints with `--show-args`.** That covers
+  `{'password': 'X'}` and a hashtable. In a double-quoted JSON member, a value with an escaped
+  quote, such as `"ab\"cd X"`, is masked only up to the escaped quote, and the rest prints.
+* **An unparenthesized `ConvertTo-SecureString 'X' -AsPlainText` prints with `--show-args`.**
+  So do its `-String 'X'` form and the value of `-ArgumentList '--pass','X'`.
+* **Do not read the exit code through a pipe that can close early.** Piping a report into
+  `head -c 100` ends with `BrokenPipeError` and exit code `120` on Windows Python 3.13, which
+  is not `1` or `2`. Write with `--out` and `--apply` instead.
+* **A self-test that is killed mid-run leaves its `taskpulse-selftest-*` temporary folder.**
+  Delete it by hand.
+* **Importing taskpulse as a module writes `__pycache__` beside it.** The folder is
+  git-ignored. Do not run `git add -A` without the `.gitignore`.
 
 ## Contributing
 

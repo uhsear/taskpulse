@@ -1829,6 +1829,28 @@ def describe_action(action, show_args=False):
         " [Start In %s]" % start if start else "")
 
 
+ZONED_TIME = re.compile(r"^(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)(\.\d+)?(?:Z|([+-])(\d\d):(\d\d))$")
+
+
+def instant_of(value):
+    """The UTC instant a timestamp with an offset names, as text; any other value unchanged.
+
+    Windows writes a trigger's StartBoundary with the offset in force on the day of the export, so
+    an unchanged task exported before and after a clock change differs in text only (-04:00 and
+    -05:00 for one instant). --diff compares the instant, so that is not a change.
+    """
+    found = ZONED_TIME.match(value)
+    if not found:
+        return value
+    try:
+        local = datetime.strptime(found.group(1), "%Y-%m-%dT%H:%M:%S")
+    except ValueError:
+        return value
+    offset = timedelta(hours=int(found.group(4) or 0), minutes=int(found.group(5) or 0))
+    utc = local + offset if found.group(3) == "-" else local - offset
+    return utc.strftime("%Y-%m-%dT%H:%M:%S") + (found.group(2) or "") + "Z"
+
+
 def describe_trigger(trigger):
     """(compare key, shown text) of one trigger. Enabled is true when the export says nothing."""
     # A list, not a dict: a monthly trigger repeats <Day>, and a dict keeps only one of them.
@@ -1837,7 +1859,7 @@ def describe_trigger(trigger):
         pairs.append(("Enabled", "true"))
     pairs.sort()
     return (trigger["kind"].lower() + "|" + ";".join(
-        "%s=%s" % (name.lower(), value.lower()) for name, value in pairs),
+        "%s=%s" % (name.lower(), instant_of(value).lower()) for name, value in pairs),
         trigger["kind"] + " " + ", ".join("%s=%s" % pair for pair in pairs))
 
 
@@ -3990,6 +4012,21 @@ def self_test():
           and "StartBoundary=2026-01-01T03:00:00" in moved[0][3]
           and moved[0][2].startswith("Daily Enabled=true,"),
           "a moved trigger is one row with the old and the new schedule")
+    summer = daily_2.replace("2026-01-01T02:00:00", "2026-05-27T08:47:36.5-04:00")
+    winter = daily_2.replace("2026-01-01T02:00:00", "2026-05-27T07:47:36.5-05:00")
+    check(diff_tasks(parsed(trigger=summer), parsed(trigger=winter)) == []
+          and diff_tasks(parsed(trigger=summer),
+                         parsed(trigger=summer.replace("-04:00", "-05:00")))[0]["field"]
+          == "trigger",
+          "one instant written with a summer and a winter offset is no change, and the same "
+          "wall clock at another offset is a change  <-- pinned defect")
+    check([instant_of(v) for v in ("2026-05-27T12:47:36Z", "2026-05-27T14:47:36+02:00",
+                                   "2026-13-27T08:47:36-04:00", "2026-05-27T08:47:36",
+                                   "PT7H")]
+          == ["2026-05-27T12:47:36Z", "2026-05-27T12:47:36Z", "2026-13-27T08:47:36-04:00",
+              "2026-05-27T08:47:36", "PT7H"],
+          "a plus offset, Z, a time with no offset, an impossible date and a duration all "
+          "read as written or as their UTC instant")
     boot = "<BootTrigger><Delay>PT1M</Delay></BootTrigger>"
     check(diff_tasks(parsed(trigger=daily_2 + boot), parsed(trigger=boot + daily_2)) == []
           and changes(parsed(trigger=daily_2), parsed(trigger=daily_2 + boot))
