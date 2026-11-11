@@ -219,7 +219,7 @@ SEVERITY  TASK                         CHECK             DETAIL
 --------  ---------------------------  ----------------  -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
 Error     \GIS\export-to-share         s4u-network       logon type is S4U ('Do not store password'), which has no network credentials, so \\fileserver\gis is unreachable
 Error     \GIS\locator-rebuild         start-in-missing  Start In is empty, so the relative path rebuild.py resolves against C:\Windows\System32
-Error     \GIS\nightly-parcel-refresh  interactive-only  logon type is interactive: the task runs only while EXAMPLE\svc-etl is logged on, so its Daily trigger does nothing when nobody is
+Error     \GIS\nightly-parcel-refresh  interactive-only  logon type is interactive: the task runs only while EXAMPLE\svc-etl is logged on, so its Daily trigger does nothing when nobody is logged on
 Error     \GIS\tile-cache              start-in-quoted   Start In "C:\tile work" is quoted; Task Scheduler does not strip the quotes and the task fails to start with 0x8007010B (the directory name is invalid)
 Warning   \GIS\export-to-share         logon-minority    logon type s4u differs from the 4 other task(s) in this folder that run as EXAMPLE\svc-etl, which use password: if this is not deliberate, a settings change flipped it
 Warning   \GIS\locator-rebuild         bare-program      python.exe has no folder, so it resolves against Start In and then the run-as account's PATH; which program runs, if any, depends on that account
@@ -1551,6 +1551,23 @@ apart gets ignored the first night it reports one.
   exists but cannot be read makes `inside()` stop with exit `1`, not a usage error with exit `64`.
   A `--lint` of a single file also lets `--out` name a new file in the same folder. A later folder
   lint of that folder then stops with "no <Task> element found" and exit `1`, never a false clean.
+* **A trigger time with fractional seconds is compared as text after the change to UTC.** The same
+  instant written with and without fractional seconds, such as `...T09:00:00-04:00` and
+  `...T13:00:00.0000000+00:00`, reads as a change in `--diff`.
+* **An unquoted `-Command` body that holds `-f` makes the word after it the reported target.**
+  The `-File` rule also matches `-f` there. Quote the body.
+* **A task name with a lone surrogate cannot be written in `csv` or `table` form with `--out`.**
+  Only the live read can produce one. The `--out` file is left empty and the run ends with a
+  `UnicodeEncodeError` traceback and exit `1`.
+* **A symbolic link to a file inside a linted folder is followed.** Only a linked subfolder
+  stops the run. Point `--lint` at a folder you control.
+* **An invalid `--match` regex can echo part of the pattern on stderr.** An unknown group name in
+  `(?P=name)` is one case. Never put a secret in a pattern.
+* **A nonzero code outside the documented `SCHED_*` set is an `Error`.** Some Windows built-in
+  tasks report codes that may be informational, such as `0x40010004` on
+  `CreateExplorerShellUnelevatedTask`. No Microsoft page maps that code.
+* **A `LogonType` value that Task Scheduler does not define gets no finding.** A hand-edited
+  `Passwordx` lints clean with exit `0`. Task Scheduler does not write one.
 
 ## Contributing
 

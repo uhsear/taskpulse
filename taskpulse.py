@@ -1425,7 +1425,7 @@ def lint_task(task, local_drives=("C",), now=None):
         # Nothing then runs while nobody is logged on, and no run means no new result.
         add("Error" if scripted else "Warning", "interactive-only",
             "logon type is interactive: the task runs only while %s is logged on, so its %s "
-            "trigger does nothing when nobody is" % (user or "its user", " and ".join(unattended)))
+            "trigger does nothing when nobody is logged on" % (user or "its user", " and ".join(unattended)))
 
     for action in actions:
         exe = text_of(action.get("executable"))
@@ -3681,7 +3681,7 @@ def self_test():
     write_output(linted, "table", lint_out, lint=True)
     check(lint_out.getvalue().startswith("SEVERITY") and "interactive-only" in
           lint_out.getvalue(), "the lint table has its own columns")
-    check("does nothing when nobody is" in lint_out.getvalue(),
+    check("does nothing when nobody is logged on" in lint_out.getvalue(),
           "the lint table keeps a long detail whole")
     lint_csv = io.StringIO()
     write_output(linted, "csv", lint_csv, lint=True)
