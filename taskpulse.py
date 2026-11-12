@@ -5013,15 +5013,18 @@ def self_test():
                                              ("--timeout", "Hunter2"), ("--format", "Hunter2"))]
             check([code for code, _, _ in leaks] == [64] * 4
                   and not any("Hunter2" in out + err for _, out, err in leaks)
-                  and "--password" in leaks[0][2] and "--password" in leaks[1][2]
+                  and "unrecognized 2 argument(s)" in leaks[0][2]
+                  and "unrecognized 1 argument(s)" in leaks[1][2]
                   and "invalid" in leaks[2][2],
-                  "a mistyped or invalid flag value is never echoed on stderr, only the flag "
-                  "name  <-- pinned defect")
+                  "a mistyped or invalid value of any flag but --match is never echoed on "
+                  "stderr, nor is a flag name  <-- pinned defect")
             shapes = (("-pHunter2",), ("-uadmin:Hunter2",), ("--password", "-Hunter2"),
                       ("--all=Hunter2",), ("--show-ok=Hunter2",), ("--apply=Hunter2",),
                       ("--show-args=Hunter2",), ("--self-test=Hunter2",), ("--version=Hunter2",),
                       ("-h=Hunter2",), ("--ap=Hunter2",), ("--bogus=Hunter2",),
-                      ("--format=Hunter2",), ("--format=a'b\"Hunter2",),
+                      ("--format=Hunter2",), ("--format=a'b\"Hunter2",), ("--password", "--Hunter2xyz"),
+                      ("--passwordHunter2xyz",), ("--Hunter2xyz",), ("Hunter2xyz",),
+                      ("--lint", "--Hunter2xyz=a:b"),
                       ("--timeout=a'b\"Hunter2",), ("--history=Hunter2",))
             leaks = [cli(*argv) for argv in shapes]
             check([code for code, _, _ in leaks] == [64] * len(shapes)
@@ -5200,14 +5203,11 @@ class Parser(argparse.ArgumentParser):
     """argparse exits 2 on a usage error, and 2 here means an Error finding. Use 64 instead."""
 
     def error(self, message):
-        # A mistyped secret flag (--password X, -pX, --apply=X) or value would otherwise be
-        # echoed to stderr, which a monitoring check logs. Keep long flag names, drop every value.
+        # A mistyped secret flag (--password X, --Hunter2, -pX, --apply=X) would otherwise be
+        # echoed to stderr, which a monitoring check logs. Print the count and no word.
         message = re.sub(
             r"^unrecognized arguments: (.*)$",
-            lambda hit: "unrecognized arguments: %s (%d in all, values not echoed)" % (
-                " ".join(re.split(r"[=:]", word)[0] if word.startswith("--") else "-<hidden>"
-                         for word in hit.group(1).split() if word.startswith("-")),
-                len(hit.group(1).split())),
+            lambda hit: "unrecognized %d argument(s), not echoed" % len(hit.group(1).split()),
             message, flags=re.S)
         message = re.sub(r"(ignored explicit argument ).*", r"\1<hidden>", message, flags=re.S)
         message = re.sub(r"(invalid choice: ).*( \(choose from )", r"\1<hidden>\2", message,

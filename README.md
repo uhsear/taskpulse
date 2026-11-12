@@ -186,7 +186,7 @@ PASS  --lint of an export that holds only Microsoft's own tasks has no result: e
 PASS  --out on an export that --diff compares is refused and the export is untouched  <-- pinned defect
 ...
 PASS  --diff takes exactly two paths, cannot be combined with --lint or --history, and cannot be typed as a prefix  <-- pinned defect
-PASS  a mistyped or invalid flag value is never echoed on stderr, only the flag name  <-- pinned defect
+PASS  a mistyped or invalid value of any flag but --match is never echoed on stderr, nor is a flag name  <-- pinned defect
 ...
 PASS  no flag value reaches stderr in a short flag, a single-dash value, a flag that takes none, an abbreviated flag or a bad choice  <-- pinned defect
 ...
@@ -1171,8 +1171,9 @@ apart gets ignored the first night it reports one.
   numbers. This README gives those counts as words, not numbers.
 * **Linux coverage used a virtualenv.** Branch coverage is 100 percent on Windows and on
   Linux. Coverage is not installed for the Linux host's system `python3`, so the Linux
-  measurement ran in a virtualenv of that same Python 3.12.3. Both runs used coverage's C
-  extension. Coverage was not measured on Python 3.9, although the self-test ran green there.
+  measurement ran in a virtualenv of that same Python 3.12.3, with coverage's pure-Python
+  tracer (`COVERAGE_CORE=pytrace`). Coverage was not measured on Python 3.9, although the
+  self-test ran green there.
 * **The quoted self-test run is an excerpt.** Each `...` stands for `PASS` lines left out. Every
   line shown appears in a real run, in that order, and the footer count is the full count.
 * **Application exit codes are opaque.** The OS message table only knows OS codes. A task whose
@@ -1554,12 +1555,6 @@ apart gets ignored the first night it reports one.
   Use `--format json` for the full text.
 * **The self-test and the README measurements assume English Windows message text.** A
   non-English Windows install is expected to fail the OS-message assertions. This is untested.
-* **A secret that starts with two dashes is echoed in a usage error.**
-  `python taskpulse.py --password --Hunter2xyz` prints
-  `unrecognized arguments: --password --Hunter2xyz (2 in all, values not echoed)`. A long flag
-  typed with text attached to its name, such as `--passwordHunter2xyz`, is echoed as the flag
-  name. A value that looks like a long flag name is echoed, and only a value that starts with a
-  single dash is hidden. The self-test label says "a single-dash value" for this reason.
 * **`--diff --show-args` masks a generated-looking word, not every secret.** A bare word of seven
   or more letters and digits that holds a digit or a capital letter, such as `Hunter2` or
   `ZZSECKOLD`, is masked, as is a URL path segment of that shape or of 20 or more characters.
@@ -1576,18 +1571,23 @@ apart gets ignored the first night it reports one.
   element found` and `taskpulse: [Errno 2] No such file or directory: 'VALUE'` name the path
   that could not be read, so do not put a secret in a path.
 * **A second `--diff` positional gives an empty list.** The usage error reads
-  `unrecognized arguments:  (1 in all, values not echoed)`. It is cosmetic, and the exit code is
-  `64`.
+  `unrecognized 1 argument(s), not echoed`. The exit code is `64`.
 * **`--timeout` below 1 is a usage error.** It exits `64`, because a zero or negative wait could
   only end as a timeout.
 * **A control character in a live task name or author prints unchanged.** An exported XML file
   cannot carry one, because the XML parser rejects it, but the live read prints it to the terminal.
-* **A mistyped flag does not echo its value.** The usage error names a long flag, such as
-  `--password`, and the count of arguments. It prints a short flag, such as `-pSECRET`, as
-  `-<hidden>`, and it hides the value of a flag that takes none, such as `--apply=SECRET`, and an
-  invalid `--timeout` or `--format` value. The self-test pins these shapes with a fake password.
-  A path you pass to `--lint`, `--diff` or `--out` is echoed in the error that names it, so do
-  not put a secret in a path.
+* **A mistyped flag does not echo its value or its name.** The usage error prints only the
+  count of arguments it did not recognise, such as `unrecognized 2 argument(s), not echoed`. It
+  hides the text glued to a flag that takes none, such as `--all=SECRET`, and an invalid
+  `--timeout` or `--format` value. The self-test pins these shapes with a fake password,
+  including `--Hunter2xyz` and `--passwordHunter2xyz`. A path you pass to `--lint`, `--diff` or
+  `--out` is echoed in the error that names it, so do not put a secret in a path or in a
+  `--match` pattern.
+* **The `--out` file gets the default permissions of the account.** A diff written with
+  `--show-args` can hold a secret, so restrict the folder yourself.
+* **Task Scheduler event meanings and the empty `Start In` folder are measured, not cited.**
+  They come from measurement and the provider manifest, because Microsoft has no page for
+  them.
 * **`--local-drives` is checked only with `--lint`.** It is accepted and ignored without
   `--lint`, and a value such as `12,%` is accepted and makes every `C:` path a mapped-drive
   Warning.
