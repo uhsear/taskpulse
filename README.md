@@ -117,6 +117,8 @@ PASS  a task whose every trigger has ended is a Warning that names the last end 
 ...
 PASS  the one task whose logon type differs from two neighbours is named, with theirs
 ...
+PASS  two tasks that share a minority logon type are both named, not only a lone outlier  <-- pinned defect
+...
 PASS  a setting written out at its default, in any case, equals one left out  <-- pinned defect
 ...
 PASS  a task that gains DeleteExpiredTaskAfter PT0S is a change: Microsoft says an absent element means the task is never deleted, and PT0S deletes it at once  <-- pinned defect
@@ -200,10 +202,10 @@ PASS  importing taskpulse runs nothing and prints nothing
 PASS  the import probe writes no .pyc beside the script  <-- pinned defect
 os message table: present
 --------------------------------------------------------------------
-726 assertions, 0 failed
+728 assertions, 0 failed
 ```
 
-The same command prints `726 assertions, 0 failed` on Windows with Python 3.13, 3.12 and 3.9, and
+The same command prints `728 assertions, 0 failed` on Windows with Python 3.13, 3.12 and 3.9, and
 on Ubuntu with Python 3.12. On Linux there is no OS message table, so the line above the footer
 rule reads `os message table: absent, so its assertions check the unmapped fallback`. Six
 assertions then check the `unmapped result 0x...` text instead of the Windows wording, and the
@@ -323,7 +325,7 @@ cd taskpulse
 python taskpulse.py --self-test
 ```
 
-That is the whole setup. `--self-test` runs 726 assertions with no network, no credentials and
+That is the whole setup. `--self-test` runs 728 assertions with no network, no credentials and
 no Task Scheduler access, so it passes on a locked-down box. Then run
 `python taskpulse.py` for the health report, `python taskpulse.py --lint` for the lint, or
 `python taskpulse.py --diff old.xml new.xml` to compare two exports.
@@ -437,7 +439,7 @@ these checks. A finding is an `Error` when the next run cannot work as configure
 | `no-time-limit` | Warning | `ExecutionTimeLimit` is zero (`PT0S`, "run indefinitely") and `MultipleInstancesPolicy` is not `StopExisting`. A hung run never ends. Under the default policy, `IgnoreNew`, every later launch is dropped without an error, and under `Queue` they wait behind it. Under `Parallel` they pile up beside it. Only `IgnoreNew` drops launches, so only its finding names event `322` ("Launch request ignored, instance already running"), which `--history` reads. |
 | `run-conditions` | Warning | `RunOnlyIfIdle` or `RunOnlyIfNetworkAvailable` is true. The task is set to run only while the computer is idle, or only while a network is available, so a trigger that fires while that is false can leave the run unstarted, and `Last Run Result` still shows the previous run. |
 | `trigger-expired` | Warning | Every enabled trigger has an `EndBoundary` more than a day in the past, so no trigger can start the task again. Task Scheduler reports `0x00041304` (`SCHED_S_TASK_NO_MORE_RUNS`, "no more runs"; see [Microsoft's constants page](https://learn.microsoft.com/en-us/windows/win32/taskschd/task-scheduler-error-and-success-constants)), which the health report counts as a non-error. A time with no zone is the machine's local time, which an export does not say, so a trigger counts as ended only a day after its end. |
-| `logon-minority` | Warning | The task's logon type differs from its neighbours. Neighbours are the enabled tasks in the same folder that run as the same account. The type has to be shared by two or more of them, and by more than any other type, so a tie names nobody. A heuristic: a task can differ on purpose. |
+| `logon-minority` | Warning | The task's logon type differs from its neighbours. Neighbours are the enabled tasks in the same folder that run as the same account. The majority type has to be shared by two or more of them, and by more than any other type, so a tie names nobody. Every task outside the majority is named, whether it stands alone or shares its type with other tasks, so four tasks on `password` and two on `interactive` name both of the two. A heuristic: a task can differ on purpose. |
 | `read-failed` | Warning | The live read could not get the task's actions, triggers or run details, so the other checks may have missed a finding. An exported XML task never gets it. |
 
 "A script" means the action runs an interpreter or a script file: Python, PowerShell, `cmd`,
@@ -1094,7 +1096,8 @@ apart gets ignored the first night it reports one.
   itself, so it exits `1`, as a failed inventory read does. Exit `2` means a task in `Error`,
   and a failed history read still exits `2` when a task is in `Error`. Then the `history`
   field, `failed`, tells the two runs apart. Under Nagios-style checks, exit `1` means WARNING,
-  not UNKNOWN. A mistyped flag, such as `--ap`, exits `64`, as every usage error does.
+  not UNKNOWN (return codes `0` OK, `1` Warning, `2` Critical, `3` Unknown, per the
+  [Nagios plugin guidelines](https://nagios-plugins.org/doc/guidelines.html)). A mistyped flag, such as `--ap`, exits `64`, as every usage error does.
 * **Elevation changes what you see.** Unelevated, tasks in protected folders and tasks owned by
   other users may be missing, or present with no `Get-ScheduledTaskInfo` detail. A task whose
   run details, actions or triggers could not be read is a `Warning`, with "the live read could
@@ -1393,7 +1396,7 @@ apart gets ignored the first night it reports one.
 * **There is no network path**, so there is nothing to test against a stub server.
 * **Mutation survivors are test gaps, not wrong output today.** A sweep of 1839 mutants of the
   non-test code (a flipped comparison, an `and`/`or` swap, a dropped branch, a constant moved by
-  one, a swapped severity or state string) was run against the self-test at 680 assertions, a count that has since grown to 726. It
+  one, a swapped severity or state string) was run against the self-test at 680 assertions, a count that has since grown to 728. It
   killed 1716, and 123 survived. Most survivors are equivalent mutants or unused constants. Six
   gaps were real, and none gave a wrong output. After the sweep the self-test pinned the detail
   text of the Running-state `STUCK` rule and three boundaries: a refusal at exactly the 7-day
@@ -1606,6 +1609,28 @@ apart gets ignored the first night it reports one.
   `...T13:00:00.0000000+00:00`, reads as a change in `--diff`.
 * **An unquoted `-Command` body that holds `-f` makes the word after it the reported target.**
   The `-File` rule also matches `-f` there. Quote the body.
+* **A `-File`, `-m` or `-f` with no script name after it reports the next word.** A malformed
+  `-File -Password:X` or `python -m --key=X` can print that switch's value as the target in the
+  report. A `-File` value that quotes a whole call, such as `-File "x.ps1 -Password X"`, prints
+  only its script word.
+* **Exit `2` hides an incomplete read in the same run.** A run with an `Error` finding and an
+  unreadable history, an incomplete task read or an unreadable task exits `2`, so a check that
+  maps `2` to findings cannot see that the tool also failed to read everything. Read the
+  messages on stderr.
+* **`table` output prints task text unchanged.** A task name, Start In or other value with a line
+  break or a terminal escape sequence breaks a table row or moves the cursor. `json` escapes it
+  and `csv` quotes it.
+* **A command line in the `Execute` field is cut, but a URL there can print its password.** The
+  health `target` of a program written as `https://user:SECRET@host/x` is not masked. Task
+  Scheduler does not run a URL as a command.
+* **The default masks any capitalised word of seven or more letters.** In the health `target` and
+  the default diff action row, a path whose folder name holds a word such as `Experience`
+  can print `***` in place of that word, and a bare `PowerShell` with no `.exe` can print as
+  `***`. The verdict is unaffected.
+* **`--out` to a folder that does not exist passes without `--apply`.** The check-only run exits
+  `0` with its notice. The failure shows only when `--apply` writes, and exits `1`.
+* **A malformed `ExecutionTimeLimit` such as `PT` counts as `run indefinitely`,** and an unknown
+  `MultipleInstancesPolicy` gets no finding. Windows writes neither value.
 * **A task name with a lone surrogate cannot be written in `csv` or `table` form with `--out`.**
   Only the live read can produce one. The `--out` file is left empty and the run ends with a
   `UnicodeEncodeError` traceback and exit `1`.

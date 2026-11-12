@@ -726,7 +726,14 @@ def classify_command(executable, arguments):
     if name in POWERSHELL_EXES:
         for index, token in enumerate(lowered):
             if token in ("-file", "-f") and index + 1 < len(tokens):
-                return unquote(tokens[index + 1]), "PowerShellScript"
+                value = unquote(tokens[index + 1])
+                if re.search(r"\s", value):
+                    # The whole call was quoted as the value: only the script word may print.
+                    words = [w for w in script_words([value]) if w]
+                    value = next((w for w in words if extension_of(w) == ".ps1"),
+                                 words[0] if words else "")
+                    value = "" if value.startswith("-") else value
+                return value, "PowerShellScript"
         for token in script_words(tokens):
             if token and not token.startswith("-") and extension_of(token) == ".ps1":
                 return token, "PowerShellScript"
@@ -1364,8 +1371,9 @@ def logon_minorities(tasks):
 
     Neighbours are the enabled tasks in the same folder that run as the same account. A logon
     type counts as the majority only when two or more neighbours share it and no other type
-    has as many, so a tie names nobody. A heuristic, not a Task Scheduler rule: a task can
-    differ on purpose, and the finding is a Warning for that reason. It is how a settings
+    has as many, so a tie names nobody. Every task outside the majority is named, whether it
+    stands alone or shares its type with others. A heuristic, not a Task Scheduler rule: a
+    task can differ on purpose, and the finding is a Warning for that reason. It is how a settings
     change that flips one nightly job to another logon type shows up beside the jobs it used
     to match.
     """
@@ -1385,7 +1393,7 @@ def logon_minorities(tasks):
         if len(top) != 1 or counts[top[0]] < 2:
             continue
         for name, kind, user in members:
-            if counts[kind] == 1:
+            if kind != top[0]:
                 found[name] = (
                     "logon type %s differs from the %d other task(s) in this folder that run as "
                     "%s, which use %s: if this is not deliberate, a settings change flipped it"
@@ -2382,6 +2390,20 @@ def self_test():
     check(classify_command("cmd.exe", r'/c "C:\my jobs\refresh.bat"')
           == (r"C:\my jobs\refresh.bat", "BatchScript"),
           "a quoted body that is one rooted path with a space stays whole")
+    quoted_call = [
+        classify_command("powershell.exe", r'-NoProfile -File "C:\jobs\x.ps1 -Password Hunter2xQ"'),
+        classify_command("powershell.exe", r"-f 'C:\jobs\x.ps1 -Password Hunter2xQ'"),
+        classify_command("powershell.exe", r'-File "C:\my jobs\x.ps1 -Password Hunter2xQ"'),
+        classify_command("powershell.exe", r'-File "C:\jobs\run script -Password Hunter2xQ"'),
+        classify_command("powershell.exe", '-File "-Password Hunter2xQ"'),
+        classify_command("powershell.exe", '-File "& ;"')]
+    check(quoted_call == [(r"C:\jobs\x.ps1", "PowerShellScript"),
+                          (r"C:\jobs\x.ps1", "PowerShellScript"),
+                          (r"C:\my jobs\x.ps1", "PowerShellScript"),
+                          (r"C:\jobs\run", "PowerShellScript"), ("", "PowerShellScript"),
+                          ("", "PowerShellScript")],
+          "a whole call quoted as the -File value reports only the script word, never a secret"
+          "  <-- pinned defect")
     check(classify_command("cmd.exe", "/c exit 0") == ("cmd.exe", "CommandShell"),
           "cmd with no batch file is the command shell itself")
     check(classify_command("cscript.exe", r"//B C:\jobs\legacy.vbs")
@@ -3993,6 +4015,14 @@ def self_test():
                                           named("c", "InteractiveToken"), named("d", "S4U")]))
           == 2,
           "a tie names nobody, and with two outliers against a pair both are named")
+    four_two = [named("p%d" % n, "Password") for n in range(4)] + [
+        named("i%d" % n, "InteractiveToken") for n in range(2)]
+    check(sorted(logon_minorities(four_two)) == [r"\Jobs\i0", r"\Jobs\i1"]
+          and "the 4 other task(s)" in logon_minorities(four_two)[r"\Jobs\i0"]
+          and sorted(logon_minorities(four_two[1:] + [named("s", "S4U")]))
+          == [r"\Jobs\i0", r"\Jobs\i1", r"\Jobs\s"],
+          "two tasks that share a minority logon type are both named, not only a lone outlier"
+          "  <-- pinned defect")
     check(logon_minorities([named("a", "Password"), named("b", "Password"),
                             named("c", "InteractiveToken", folder="\\Other\\")]) == {}
           and logon_minorities([named("a", "Password"), named("b", "Password"),
