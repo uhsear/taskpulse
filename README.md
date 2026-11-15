@@ -202,10 +202,10 @@ PASS  importing taskpulse runs nothing and prints nothing
 PASS  the import probe writes no .pyc beside the script  <-- pinned defect
 os message table: present
 --------------------------------------------------------------------
-728 assertions, 0 failed
+733 assertions, 0 failed
 ```
 
-The same command prints `728 assertions, 0 failed` on Windows with Python 3.13, 3.12 and 3.9, and
+The same command prints `733 assertions, 0 failed` on Windows with Python 3.13, 3.12 and 3.9, and
 on Ubuntu with Python 3.12. On Linux there is no OS message table, so the line above the footer
 rule reads `os message table: absent, so its assertions check the unmapped fallback`. Six
 assertions then check the `unmapped result 0x...` text instead of the Windows wording, and the
@@ -325,7 +325,7 @@ cd taskpulse
 python taskpulse.py --self-test
 ```
 
-That is the whole setup. `--self-test` runs 728 assertions with no network, no credentials and
+That is the whole setup. `--self-test` runs 733 assertions with no network, no credentials and
 no Task Scheduler access, so it passes on a locked-down box. Then run
 `python taskpulse.py` for the health report, `python taskpulse.py --lint` for the lint, or
 `python taskpulse.py --diff old.xml new.xml` to compare two exports.
@@ -1203,9 +1203,6 @@ apart gets ignored the first night it reports one.
   so a dashboard that reads only that file sees the previous run's report.
 * **`--out` is written in place.** It is not written to a temporary file and renamed, so a
   crash or a full disk during the write leaves a truncated report at that path.
-* **The table prints names as they are.** Task names, authors, accounts and `Start In` values
-  are text that anyone who registers a task sets. A terminal control sequence in one of them
-  reaches the console unchanged.
 * **PowerShell is started by its bare name.** Windows looks in the current folder before
   System32, so a `powershell.exe` planted in the folder you run taskpulse from runs instead of
   the real one. Windows also searches the folder of the running `python.exe` first, so a
@@ -1396,7 +1393,7 @@ apart gets ignored the first night it reports one.
 * **There is no network path**, so there is nothing to test against a stub server.
 * **Mutation survivors are test gaps, not wrong output today.** A sweep of 1839 mutants of the
   non-test code (a flipped comparison, an `and`/`or` swap, a dropped branch, a constant moved by
-  one, a swapped severity or state string) was run against the self-test at 680 assertions, a count that has since grown to 728. It
+  one, a swapped severity or state string) was run against the self-test at 680 assertions, a count that has since grown to 733. It
   killed 1716, and 123 survived. Most survivors are equivalent mutants or unused constants. Six
   gaps were real, and none gave a wrong output. After the sweep the self-test pinned the detail
   text of the Running-state `STUCK` rule and three boundaries: a refusal at exactly the 7-day
@@ -1577,8 +1574,6 @@ apart gets ignored the first night it reports one.
   `unrecognized 1 argument(s), not echoed`. The exit code is `64`.
 * **`--timeout` below 1 is a usage error.** It exits `64`, because a zero or negative wait could
   only end as a timeout.
-* **A control character in a live task name or author prints unchanged.** An exported XML file
-  cannot carry one, because the XML parser rejects it, but the live read prints it to the terminal.
 * **A mistyped flag does not echo its value or its name.** The usage error prints only the
   count of arguments it did not recognise, such as `unrecognized 2 argument(s), not echoed`. It
   hides the text glued to a flag that takes none, such as `--all=SECRET`, and an invalid
@@ -1617,9 +1612,10 @@ apart gets ignored the first night it reports one.
   unreadable history, an incomplete task read or an unreadable task exits `2`, so a check that
   maps `2` to findings cannot see that the tool also failed to read everything. Read the
   messages on stderr.
-* **`table` output prints task text unchanged.** A task name, Start In or other value with a line
-  break or a terminal escape sequence breaks a table row or moves the cursor. `json` escapes it
-  and `csv` quotes it.
+* **`table` and `csv` output show unsafe characters as escapes.** A control, bidi, zero-width
+  or line-separator character in a task name or other value prints as `\x1b` or `\u202e`, so it
+  cannot move the cursor, reorder a line or hide text. `json` escapes it as before. An error
+  message on stderr that names a task or a path is scrubbed the same way; other stderr text is not.
 * **A command line in the `Execute` field is cut, but a URL there can print its password.** The
   health `target` of a program written as `https://user:SECRET@host/x` is not masked. Task
   Scheduler does not run a URL as a command.

@@ -2149,8 +2149,26 @@ TABLE_HEADER = ["STATUS", "TASK", "SCHEDULE", "LAST RESULT", "WHY"]
 LINT_FIELDS = ["severity", "task", "check", "detail"]
 
 
+# Control characters (C0, DEL, C1), line and paragraph separators, bidi controls and zero-width
+# marks, including the byte order mark.
+UNSAFE_TEXT = re.compile("[\\x00-\\x1f\\x7f-\\x9f\\u200b-\\u200f\\u2028-\\u202e\\u2066-\\u2069\\ufeff]")
+
+
+def scrub(value):
+    r"""Show each unsafe character of a string as \xNN or \uNNNN. Other values pass through.
+
+    A task name, author or argument is anybody's text. Raw, an ESC sequence moves the cursor, a
+    bidi mark reorders a line and a zero-width mark hides text, so a hostile name could forge a
+    report line. JSON already escapes all of these, so only table and csv call this.
+    """
+    if not isinstance(value, str):
+        return value
+    return UNSAFE_TEXT.sub(lambda m: "\\x%02x" % ord(m.group()) if ord(m.group()) < 256
+                           else "\\u%04x" % ord(m.group()), value)
+
+
 def render_table(rows, columns=COLUMNS, header=TABLE_HEADER, cap=60):
-    table = [header] + [[str(row.get(key, "")) for key in columns] for row in rows]
+    table = [header] + [[scrub(str(row.get(key, ""))) for key in columns] for row in rows]
     widths = [min(cap, max(len(line[i]) for line in table)) for i in range(len(header))]
     out = []
     for index, line in enumerate(table):
@@ -2175,7 +2193,7 @@ def write_output(rows, fmt, stream, lint=False, diff=False):
             # cell that starts with = + - @ as a formula, so a quote makes it text again.
             writer.writerow(dict((key, "'" + value if isinstance(value, str)
                                   and value[:1] in ("=", "+", "-", "@", "\t", "\r") else value)
-                                 for key, value in row.items()))
+                                 for key, value in ((k, scrub(v)) for k, v in row.items())))
     elif diff:
         stream.write(render_table(rows, DIFF_FIELDS, [f.upper() for f in DIFF_FIELDS], 240)
                      + "\n" if rows else "No differences.\n")
@@ -5189,6 +5207,24 @@ def self_test():
           "importing taskpulse runs nothing and prints nothing")
     check(stamp() == before, "the import probe writes no .pyc beside the script  <-- pinned defect")
 
+    hostile = "ok\x1b[2K\rFAKE\u202e\u200b\u2067\ufeff\x7f\x9b\u2028"
+    hostile_row = dict(evaluate({}), task="\\" + hostile, author=hostile)
+    unsafe = [c for c in hostile if c not in "ok[2KFAKE"]
+    for fmt in ("table", "csv", "json"):
+        hostile_out = io.StringIO()
+        write_output([hostile_row], fmt, hostile_out)
+        check(not any(c in hostile_out.getvalue() for c in unsafe),
+              "a hostile task name never sends ESC, control, bidi or zero-width characters to "
+              "the %s report  <-- pinned defect" % fmt)
+    hostile_table = io.StringIO()
+    write_output([hostile_row], "table", hostile_table)
+    check("ok\\x1b[2K\\x0dFAKE\\u202e\\u200b" in hostile_table.getvalue()
+          and len(hostile_table.getvalue().splitlines()) == 3,
+          "the table shows each hostile character as an escape and keeps one line per row")
+    check(scrub("Parcels \u00e9\u00e8 \u65e5\u672c C:\\jobs\\a b") == "Parcels \u00e9\u00e8 \u65e5\u672c C:\\jobs\\a b"
+          and scrub(7) == 7 and scrub("") == "",
+          "scrub leaves ordinary text, accents, other scripts and non-strings unchanged")
+
     print("os message table: %s" % ("present" if windows
                                      else "absent, so its assertions check the unmapped fallback"))
     return finish()
@@ -5427,7 +5463,7 @@ def main(argv=None):
             name = repeated_name(side)
             if name:
                 sys.stderr.write("taskpulse: %s holds more than one task named %s; compare one "
-                                 "export of each task\n" % (path, name))
+                                 "export of each task\n" % (scrub(path), scrub(name)))
                 return 1
         rows = diff_tasks(sides[0], sides[1], args.show_args)
         rows = [row for row in rows if pattern.search(row["task"])]
